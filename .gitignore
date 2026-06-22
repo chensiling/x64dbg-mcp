@@ -1,0 +1,11 @@
+build/
+*.dp64
+*.dp32
+*.pdb
+*.exp
+*.lib
+*.obj
+__pycache__/
+*.pyc
+.env
+pluginsdk/
