@@ -125,11 +125,11 @@ C:\path\to\x64dbg\release\x64\plugins\mcp_bridge.dp64
 ### 断点
 | 工具 | 说明 |
 |------|------|
-| `breakpoint_set` | 设断点（普通/硬件/内存），支持条件和硬件类型 |
+| `breakpoint_set` | 设断点（普通/硬件/内存），支持硬件类型 |
 | `breakpoint_delete` | 删除断点 |
 | `breakpoint_toggle` | 切换断点启用/禁用 |
-| `breakpoints_list` | 列出所有断点 |
-| `set_bp_filter` | 设置文件名过滤——不匹配则自动跳过（大小写不敏感） |
+| `breakpoints_list` | 列出所有断点，包含条件、命中次数、日志/命令文本等扩展字段 |
+| `set_bp_filter` | 设置 x64dbg 原生条件断点表达式 |
 | `run_to` | 设临时一次性断点并运行到该地址 |
 
 ### 调试控制
@@ -173,15 +173,27 @@ C:\path\to\x64dbg\release\x64\plugins\mcp_bridge.dp64
 | `get_function_info` | 获取函数边界（起始/结束地址） |
 | `cmd_exec` | 直接执行 x64dbg 控制台命令 |
 
-## 条件断点自动过滤
+## 条件断点
 
 ```
-# 只有文件名包含 "Test1.txt" 时才停下
-breakpoint_set addr="0x7FFC91037160"                      # 在 CreateFileW 设断点
-set_bp_filter addr="0x7FFC91037160" filename="Test1.txt"   # 不匹配则自动 F9
+# 只有 RCX 等于目标值时才停下
+breakpoint_set addr="0x7FFC91037160"
+set_bp_filter addr="0x7FFC91037160" condition="rcx==0x1234"
+
+# 只有 RCX 指向内存的首字节是 'M' 时才停下
+set_bp_filter addr="0x7FFC91037160" condition="byte:[rcx]==0x4D"
+
+# 只有 RDX+8 指向的 qword 非零时才停下
+set_bp_filter addr="0x7FFC91037160" condition="qword:[rdx+8]!=0"
+
+# 多个条件全部成立时才停下，最终写入 ((rcx!=0)&&(rdx!=0)&&(byte:[rcx]==0x4D))
+set_bp_filter addr="0x7FFC91037160" conditions='["rcx!=0","rdx!=0","byte:[rcx]==0x4D"]' op="and"
+
+# 多个条件任一成立时停下
+set_bp_filter addr="0x7FFC91037160" conditions='["rcx==0x1234","rdx==0x5678"]' op="or"
 ```
 
-桥接插件拦截断点命中事件，读取 RCX 指向的文件名参数，将 UTF-16LE 转为 UTF-8 后比对。不匹配自动继续运行，零人工干预。
+`set_bp_filter` 直接设置 x64dbg 原生断点条件。可以传单个 `condition`，也可以传 `conditions` 数组并用 `op="and"` 或 `op="or"` 拼成一个表达式。表达式结果非 0 时停下，结果为 0 时由 x64dbg 自己继续执行。条件可引用寄存器、内存、算术表达式和 x64dbg 支持的表达式函数。
 
 ## 设计要点
 

@@ -16,6 +16,17 @@ DEFAULT_BUFFER_SIZE = 256 * 1024
 ADDR_KEYS = {"addr", "address", "module_base", "base", "start", "end", "from", "to"}
 
 
+def _error_response(code: str, message: str, bridge_id: Any = None) -> dict:
+    response = {
+        "ok": False,
+        "data": None,
+        "error": {"code": code, "message": message},
+    }
+    if bridge_id is not None:
+        response["bridge_id"] = bridge_id
+    return response
+
+
 def _convert_addrs(params: dict) -> dict:
     """Convert integer address params to hex strings (safety net for JSON precision)."""
     if not params:
@@ -27,6 +38,42 @@ def _convert_addrs(params: dict) -> dict:
         else:
             result[k] = v
     return result
+
+
+def _normalize_response(response: Any) -> dict:
+    """Convert bridge JSON-RPC-ish responses into a stable MCP payload shape."""
+    if not isinstance(response, dict):
+        return _error_response("INVALID_RESPONSE", f"Expected object, got {type(response).__name__}")
+
+    bridge_id = response.get("id")
+    if "error" in response:
+        error = response["error"]
+        if isinstance(error, dict):
+            code = str(error.get("code", "BRIDGE_ERROR"))
+            message = str(error.get("message", error))
+        else:
+            code = "BRIDGE_ERROR"
+            message = str(error)
+        return _error_response(code, message, bridge_id)
+
+    data = response.get("result", response.get("data", response))
+    ok = True
+    error = None
+    if isinstance(data, dict) and data.get("ok") is False:
+        ok = False
+        error = {
+            "code": "COMMAND_FAILED",
+            "message": str(data.get("error", "Bridge command failed")),
+        }
+
+    normalized = {
+        "ok": ok,
+        "data": data,
+        "error": error,
+    }
+    if bridge_id is not None:
+        normalized["bridge_id"] = bridge_id
+    return normalized
 
 
 class BridgeClient:
@@ -73,7 +120,7 @@ class BridgeClient:
     def call(self, method: str, params: Optional[dict] = None,
              timeout_ms: int = PIPE_TIMEOUT_MS) -> dict:
         if self._handle is None:
-            return {"error": "Not connected to bridge"}
+            return _error_response("NOT_CONNECTED", "Not connected to bridge")
 
         request = json.dumps({
             "id": str(int(time.time() * 1000000)),
@@ -84,17 +131,17 @@ class BridgeClient:
         try:
             self._send(request)
             response_str = self._recv()
-            return json.loads(response_str)
+            return _normalize_response(json.loads(response_str))
         except (pywintypes.error, json.JSONDecodeError) as e:
             self.disconnect()
             if self.connect():
                 try:
                     self._send(request)
                     response_str = self._recv()
-                    return json.loads(response_str)
+                    return _normalize_response(json.loads(response_str))
                 except Exception:
                     pass
-            return {"error": str(e)}
+            return _error_response("TRANSPORT_ERROR", str(e))
 
     def __enter__(self):
         self.connect()

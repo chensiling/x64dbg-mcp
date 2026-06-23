@@ -13,11 +13,6 @@ static volatile LONG g_running = 0;
 static int g_pluginHandle = 0;
 static bool g_consoleAllocated = false;
 
-#define MAX_BP_FILTERS 16
-static duint g_bpFilterAddrs[MAX_BP_FILTERS];
-static char g_bpFilterPatterns[MAX_BP_FILTERS][256];
-static int g_bpFilterCount = 0;
-
 static void hex_encode(const unsigned char* data, size_t len, char* out)
 {
     for(size_t i = 0; i < len; i++)
@@ -73,62 +68,6 @@ static void log_msg(const char* format, ...)
     _plugin_logputs(buf);
 }
 
-static void bp_filter_callback(CBTYPE cbType, void* callbackInfo)
-{
-    if(cbType != CB_BREAKPOINT) return;
-    PLUG_CB_BREAKPOINT* bp = (PLUG_CB_BREAKPOINT*)callbackInfo;
-    if(!bp || !bp->breakpoint) return;
-
-    duint bpAddr = bp->breakpoint->addr;
-    for(int i = 0; i < g_bpFilterCount; i++)
-    {
-        if(g_bpFilterAddrs[i] != bpAddr) continue;
-
-        // Read RCX (filename pointer)
-        REGDUMP_AVX512 regdump = {0};
-        if(!DbgGetRegDumpEx(&regdump, sizeof(REGDUMP_AVX512))) return;
-        duint rcx = regdump.regcontext.ccx;
-
-        // Read wide string
-        unsigned char buf[512] = {0};
-        if(!DbgMemRead(rcx, buf, sizeof(buf) - 1)) return;
-        wchar_t wbuf[256] = {0};
-        memcpy(wbuf, buf, sizeof(buf) - 2);
-        size_t wlen = 0;
-        for(size_t j = 0; j < 256 && wbuf[j] != 0; j++) wlen++;
-
-        char filename[512] = {0};
-        if(wlen > 0)
-        {
-            int len = WideCharToMultiByte(CP_UTF8, 0, wbuf, (int)wlen, filename, sizeof(filename) - 1, NULL, NULL);
-            if(len > 0) filename[len] = '\0';
-        }
-
-        // Case-insensitive substring match
-        const char* pattern = g_bpFilterPatterns[i];
-        bool matched = false;
-        for(const char* h = filename; *h && !matched; h++)
-        {
-            const char* n = pattern;
-            const char* hh = h;
-            while(*n && *hh && tolower((unsigned char)*n) == tolower((unsigned char)*hh))
-                { n++; hh++; }
-            if(*n == '\0') matched = true;
-        }
-
-        if(!matched)
-        {
-            log_msg("[BP Filter] Skip %llX (not %s)", (unsigned long long)bpAddr, pattern);
-            DbgCmdExec("run");
-        }
-        else
-        {
-            log_msg("[BP Filter] HIT %llX = %s", (unsigned long long)bpAddr, pattern);
-        }
-        break;
-    }
-}
-
 static bool get_addr_param(json_t* params, const char* key, duint* out)
 {
     json_t* val = json_object_get(params, key);
@@ -176,6 +115,11 @@ static json_t* addr_json(duint value)
     return json_string(buf);
 }
 
+static json_t* json_string_safe(const char* value)
+{
+    return json_string(value ? value : "");
+}
+
 static char* json_escape(const char* src)
 {
     json_t* j = json_string(src);
@@ -190,7 +134,7 @@ static char* json_escape(const char* src)
 static json_t* build_value_response(const char* id, json_t* data)
 {
     json_t* resp = json_object();
-    json_object_set_new(resp, "id", json_string(id));
+    json_object_set_new(resp, "id", json_string_safe(id));
     if(data)
         json_object_set_new(resp, "result", data);
     else
@@ -201,9 +145,105 @@ static json_t* build_value_response(const char* id, json_t* data)
 static json_t* build_error_response(const char* id, const char* msg)
 {
     json_t* resp = json_object();
-    json_object_set_new(resp, "id", json_string(id));
-    json_object_set_new(resp, "error", json_string(msg));
+    json_object_set_new(resp, "id", json_string_safe(id));
+    json_object_set_new(resp, "error", json_string_safe(msg));
     return resp;
+}
+
+static const char* get_debug_state_string()
+{
+    if(!DbgIsDebugging())
+        return "stopped";
+    return DbgIsRunning() ? "running" : "paused";
+}
+
+static bool wait_for_debug_state(const char* expected, DWORD timeoutMs)
+{
+    DWORD start = GetTickCount();
+    do
+    {
+        if(strcmp(get_debug_state_string(), expected) == 0)
+            return true;
+        Sleep(25);
+    } while(GetTickCount() - start < timeoutMs);
+
+    return strcmp(get_debug_state_string(), expected) == 0;
+}
+
+static bool append_condition_expr(char* out, size_t outSize, const char* text, char* err, size_t errSize)
+{
+    size_t used = strlen(out);
+    int written = snprintf(out + used, outSize - used, "%s", text);
+    if(written < 0 || (size_t)written >= outSize - used)
+    {
+        snprintf(err, errSize, "combined condition is too long");
+        return false;
+    }
+    return true;
+}
+
+static bool build_break_condition(json_t* params, char* out, size_t outSize, char* err, size_t errSize)
+{
+    out[0] = '\0';
+    json_t* conditionValue = json_object_get(params, "condition");
+    json_t* conditionsValue = json_object_get(params, "conditions");
+
+    if(conditionValue)
+    {
+        if(!json_is_string(conditionValue) || !json_string_value(conditionValue)[0])
+        {
+            snprintf(err, errSize, "condition must be a non-empty string");
+            return false;
+        }
+        return append_condition_expr(out, outSize, json_string_value(conditionValue), err, errSize);
+    }
+
+    if(!conditionsValue)
+    {
+        snprintf(err, errSize, "set_bp_filter requires condition or conditions");
+        return false;
+    }
+    if(!json_is_array(conditionsValue) || json_array_size(conditionsValue) == 0)
+    {
+        snprintf(err, errSize, "conditions must be a non-empty string array");
+        return false;
+    }
+
+    const char* op = json_string_value(json_object_get(params, "op"));
+    if(!op || !op[0])
+        op = "and";
+
+    const char* joiner = NULL;
+    if(_stricmp(op, "and") == 0)
+        joiner = "&&";
+    else if(_stricmp(op, "or") == 0)
+        joiner = "||";
+    else
+    {
+        snprintf(err, errSize, "op must be 'and' or 'or'");
+        return false;
+    }
+
+    size_t count = json_array_size(conditionsValue);
+    for(size_t i = 0; i < count; i++)
+    {
+        json_t* item = json_array_get(conditionsValue, i);
+        if(!json_is_string(item) || !json_string_value(item)[0])
+        {
+            snprintf(err, errSize, "conditions must contain only non-empty strings");
+            return false;
+        }
+
+        if(i > 0 && !append_condition_expr(out, outSize, joiner, err, errSize))
+            return false;
+        if(!append_condition_expr(out, outSize, "(", err, errSize))
+            return false;
+        if(!append_condition_expr(out, outSize, json_string_value(item), err, errSize))
+            return false;
+        if(!append_condition_expr(out, outSize, ")", err, errSize))
+            return false;
+    }
+    return true;
 }
 
 static void handle_read_memory(json_t* req, json_t* params, json_t** out_resp)
@@ -469,6 +509,17 @@ static void handle_get_breakpoints(json_t* req, json_t* params, json_t** out_res
             json_object_set_new(bp, "singleshoot", json_boolean(bpMap.bp[i].singleshoot));
             json_object_set_new(bp, "name", json_string(bpMap.bp[i].name));
             json_object_set_new(bp, "module", json_string(bpMap.bp[i].mod));
+            json_object_set_new(bp, "slot", addr_json(bpMap.bp[i].slot));
+            json_object_set_new(bp, "type_ex", addr_json(bpMap.bp[i].typeEx));
+            json_object_set_new(bp, "hw_size", addr_json(bpMap.bp[i].hwSize));
+            json_object_set_new(bp, "hit_count", addr_json(bpMap.bp[i].hitCount));
+            json_object_set_new(bp, "fast_resume", json_boolean(bpMap.bp[i].fastResume));
+            json_object_set_new(bp, "silent", json_boolean(bpMap.bp[i].silent));
+            json_object_set_new(bp, "break_condition", json_string(bpMap.bp[i].breakCondition));
+            json_object_set_new(bp, "log_text", json_string(bpMap.bp[i].logText));
+            json_object_set_new(bp, "log_condition", json_string(bpMap.bp[i].logCondition));
+            json_object_set_new(bp, "command_text", json_string(bpMap.bp[i].commandText));
+            json_object_set_new(bp, "command_condition", json_string(bpMap.bp[i].commandCondition));
 
             const char* type_str = "unknown";
             switch(bpMap.bp[i].type)
@@ -522,13 +573,6 @@ static void handle_set_breakpoint(json_t* req, json_t* params, json_t** out_resp
         char cmd[512];
         snprintf(cmd, sizeof(cmd), "bp %llX", (unsigned long long)addr);
         ok = DbgCmdExecDirect(cmd);
-
-        const char* condition = json_string_value(json_object_get(params, "condition"));
-        if(ok && condition && condition[0])
-        {
-            snprintf(cmd, sizeof(cmd), "bpcnd %llX,%s", (unsigned long long)addr, condition);
-            ok = DbgCmdExecDirect(cmd);
-        }
     }
 
     json_t* data = json_object();
@@ -579,21 +623,8 @@ static void handle_get_debug_state(json_t* req, json_t* params, json_t** out_res
     (void)params;
     const char* id = json_string_value(json_object_get(req, "id"));
 
-    const char* state = "unknown";
-    if(DbgIsDebugging())
-    {
-        if(DbgIsRunning())
-            state = "running";
-        else
-            state = "paused";
-    }
-    else
-    {
-        state = "stopped";
-    }
-
     json_t* data = json_object();
-    json_object_set_new(data, "state", json_string(state));
+    json_object_set_new(data, "state", json_string(get_debug_state_string()));
     *out_resp = build_value_response(id, data);
 }
 
@@ -611,9 +642,38 @@ static void handle_pause(json_t* req, json_t* params, json_t** out_resp)
 {
     (void)params;
     const char* id = json_string_value(json_object_get(req, "id"));
-    DbgCmdExecDirect("pause");
+
     json_t* data = json_object();
-    json_object_set_new(data, "ok", json_true());
+    const char* before = get_debug_state_string();
+
+    if(strcmp(before, "stopped") == 0)
+    {
+        json_object_set_new(data, "ok", json_false());
+        json_object_set_new(data, "requested", json_false());
+        json_object_set_new(data, "state", json_string(before));
+        json_object_set_new(data, "error", json_string("Debugger is not active"));
+        *out_resp = build_value_response(id, data);
+        return;
+    }
+
+    if(strcmp(before, "paused") == 0)
+    {
+        json_object_set_new(data, "ok", json_true());
+        json_object_set_new(data, "requested", json_false());
+        json_object_set_new(data, "state", json_string(before));
+        *out_resp = build_value_response(id, data);
+        return;
+    }
+
+    bool commandOk = DbgCmdExec("pause");
+    bool paused = wait_for_debug_state("paused", 3000);
+    const char* after = get_debug_state_string();
+
+    json_object_set_new(data, "ok", json_boolean(paused));
+    json_object_set_new(data, "requested", json_boolean(commandOk));
+    json_object_set_new(data, "state", json_string(after));
+    if(!paused)
+        json_object_set_new(data, "error", json_string(commandOk ? "Timed out waiting for pause" : "Pause command failed"));
     *out_resp = build_value_response(id, data);
 }
 
@@ -1029,29 +1089,38 @@ static void handle_set_bp_filter(json_t* req, json_t* params, json_t** out_resp)
 {
     const char* id = json_string_value(json_object_get(req, "id"));
     duint addr = 0;
-    const char* filename = json_string_value(json_object_get(params, "filename"));
-    if(!get_addr_param(params, "addr", &addr) || !filename)
+    if(!get_addr_param(params, "addr", &addr))
     {
-        *out_resp = build_error_response(id, "set_bp_filter requires addr (hex string) and filename (string)");
+        *out_resp = build_error_response(id, "set_bp_filter requires addr");
         return;
     }
 
+    char condition[MAX_CONDITIONAL_EXPR_SIZE] = {0};
+    char error[256] = {0};
+    if(!build_break_condition(params, condition, sizeof(condition), error, sizeof(error)))
+    {
+        *out_resp = build_error_response(id, error);
+        return;
+    }
+
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "bpcnd %llX,%s", (unsigned long long)addr, condition);
+    bool ok = DbgCmdExecDirect(cmd);
+    log_msg("[BP Filter] Set native condition on %llX -> %s", (unsigned long long)addr, condition);
+
     json_t* data = json_object();
-    if(g_bpFilterCount < MAX_BP_FILTERS)
+    json_object_set_new(data, "ok", json_boolean(ok));
+    json_object_set_new(data, "addr", addr_json(addr));
+    json_object_set_new(data, "condition", json_string(condition));
+    const char* responseOp = "";
+    if(json_object_get(params, "conditions"))
     {
-        g_bpFilterAddrs[g_bpFilterCount] = addr;
-        strncpy(g_bpFilterPatterns[g_bpFilterCount], filename, 255);
-        g_bpFilterPatterns[g_bpFilterCount][255] = '\0';
-        g_bpFilterCount++;
-        json_object_set_new(data, "ok", json_true());
-        json_object_set_new(data, "count", addr_json(g_bpFilterCount));
-        log_msg("[BP Filter] Set filter on %llX -> %s", (unsigned long long)addr, filename);
+        responseOp = json_string_value(json_object_get(params, "op"));
+        if(!responseOp || !responseOp[0])
+            responseOp = "and";
     }
-    else
-    {
-        json_object_set_new(data, "ok", json_false());
-        json_object_set_new(data, "error", json_string("Max filters reached"));
-    }
+    json_object_set_new(data, "op", json_string(responseOp));
+    json_object_set_new(data, "command", json_string(cmd));
     *out_resp = build_value_response(id, data);
 }
 
@@ -1334,45 +1403,62 @@ static void handle_cmd_exec(json_t* req, json_t* params, json_t** out_resp)
 
 typedef void (*cmd_handler)(json_t* req, json_t* params, json_t** out_resp);
 
+struct handler_entry
+{
+    const char* method;
+    cmd_handler handler;
+};
+
+static const handler_entry HANDLERS[] = {
+    { CMD_READ_MEMORY,       handle_read_memory },
+    { CMD_WRITE_MEMORY,      handle_write_memory },
+    { CMD_DISASSEMBLE,       handle_disassemble },
+    { CMD_GET_REGISTERS,     handle_get_registers },
+    { CMD_SET_REGISTER,      handle_set_register },
+    { CMD_GET_BREAKPOINTS,   handle_get_breakpoints },
+    { CMD_SET_BREAKPOINT,    handle_set_breakpoint },
+    { CMD_DELETE_BREAKPOINT, handle_delete_breakpoint },
+    { CMD_TOGGLE_BREAKPOINT, handle_toggle_breakpoint },
+    { CMD_GET_DEBUG_STATE,   handle_get_debug_state },
+    { CMD_RUN,               handle_run },
+    { CMD_PAUSE,             handle_pause },
+    { CMD_STOP,              handle_stop },
+    { CMD_STEP_IN,           handle_step_in },
+    { CMD_STEP_OVER,         handle_step_over },
+    { CMD_STEP_OUT,          handle_step_out },
+    { CMD_GET_MODULES,       handle_get_modules },
+    { CMD_GET_MODULE_INFO,   handle_get_module_info },
+    { CMD_GET_SYMBOLS,       handle_get_symbols },
+    { CMD_EVALUATE,          handle_evaluate },
+    { CMD_GET_MEMORY_MAP,    handle_get_memory_map },
+    { CMD_GET_CALL_STACK,    handle_get_call_stack },
+    { CMD_GET_LABEL,         handle_get_label },
+    { CMD_SET_LABEL,         handle_set_label },
+    { CMD_GET_COMMENT,       handle_get_comment },
+    { CMD_SET_COMMENT,       handle_set_comment },
+    { CMD_ASSEMBLE,          handle_assemble },
+    { CMD_GET_STRING,        handle_get_string },
+    { CMD_FIND_STRING,       handle_find_string },
+    { CMD_RUN_TO,            handle_run_to },
+    { CMD_SET_EIP,           handle_set_eip },
+    { CMD_GET_THREADS,       handle_get_threads },
+    { CMD_FIND_BYTES,        handle_find_bytes },
+    { CMD_GET_FUNCTION_INFO, handle_get_function_info },
+    { CMD_GET_XREFS,         handle_get_xrefs },
+    { CMD_SET_BP_FILTER,     handle_set_bp_filter },
+    { CMD_CMD_EXEC,          handle_cmd_exec },
+};
+
 static cmd_handler get_handler(const char* method)
 {
-    if(strcmp(method, CMD_READ_MEMORY) == 0)       return handle_read_memory;
-    if(strcmp(method, CMD_WRITE_MEMORY) == 0)      return handle_write_memory;
-    if(strcmp(method, CMD_DISASSEMBLE) == 0)        return handle_disassemble;
-    if(strcmp(method, CMD_GET_REGISTERS) == 0)     return handle_get_registers;
-    if(strcmp(method, CMD_SET_REGISTER) == 0)      return handle_set_register;
-    if(strcmp(method, CMD_GET_BREAKPOINTS) == 0)   return handle_get_breakpoints;
-    if(strcmp(method, CMD_SET_BREAKPOINT) == 0)    return handle_set_breakpoint;
-    if(strcmp(method, CMD_DELETE_BREAKPOINT) == 0) return handle_delete_breakpoint;
-    if(strcmp(method, CMD_TOGGLE_BREAKPOINT) == 0) return handle_toggle_breakpoint;
-    if(strcmp(method, CMD_GET_DEBUG_STATE) == 0)   return handle_get_debug_state;
-    if(strcmp(method, CMD_RUN) == 0)                return handle_run;
-    if(strcmp(method, CMD_PAUSE) == 0)              return handle_pause;
-    if(strcmp(method, CMD_STOP) == 0)               return handle_stop;
-    if(strcmp(method, CMD_STEP_IN) == 0)            return handle_step_in;
-    if(strcmp(method, CMD_STEP_OVER) == 0)          return handle_step_over;
-    if(strcmp(method, CMD_STEP_OUT) == 0)           return handle_step_out;
-    if(strcmp(method, CMD_GET_MODULES) == 0)        return handle_get_modules;
-    if(strcmp(method, CMD_GET_MODULE_INFO) == 0)    return handle_get_module_info;
-    if(strcmp(method, CMD_GET_SYMBOLS) == 0)        return handle_get_symbols;
-    if(strcmp(method, CMD_EVALUATE) == 0)           return handle_evaluate;
-    if(strcmp(method, CMD_GET_MEMORY_MAP) == 0)     return handle_get_memory_map;
-    if(strcmp(method, CMD_GET_CALL_STACK) == 0)     return handle_get_call_stack;
-    if(strcmp(method, CMD_GET_LABEL) == 0)          return handle_get_label;
-    if(strcmp(method, CMD_SET_LABEL) == 0)          return handle_set_label;
-    if(strcmp(method, CMD_GET_COMMENT) == 0)        return handle_get_comment;
-    if(strcmp(method, CMD_SET_COMMENT) == 0)        return handle_set_comment;
-    if(strcmp(method, CMD_ASSEMBLE) == 0)           return handle_assemble;
-    if(strcmp(method, CMD_GET_STRING) == 0)         return handle_get_string;
-    if(strcmp(method, CMD_FIND_STRING) == 0)        return handle_find_string;
-    if(strcmp(method, CMD_RUN_TO) == 0)             return handle_run_to;
-    if(strcmp(method, CMD_SET_EIP) == 0)            return handle_set_eip;
-    if(strcmp(method, CMD_GET_THREADS) == 0)        return handle_get_threads;
-    if(strcmp(method, CMD_FIND_BYTES) == 0)         return handle_find_bytes;
-    if(strcmp(method, CMD_GET_FUNCTION_INFO) == 0)  return handle_get_function_info;
-    if(strcmp(method, CMD_GET_XREFS) == 0)          return handle_get_xrefs;
-    if(strcmp(method, CMD_SET_BP_FILTER) == 0)      return handle_set_bp_filter;
-    if(strcmp(method, CMD_CMD_EXEC) == 0)           return handle_cmd_exec;
+    if(!method)
+        return NULL;
+
+    for(size_t i = 0; i < sizeof(HANDLERS) / sizeof(HANDLERS[0]); i++)
+    {
+        if(strcmp(method, HANDLERS[i].method) == 0)
+            return HANDLERS[i].handler;
+    }
     return NULL;
 }
 
@@ -1383,15 +1469,26 @@ static void process_request(json_t* req, char* out_buf, size_t out_buf_size)
     const char* id = json_string_value(json_object_get(req, "id"));
 
     json_t* resp = NULL;
+    json_t* emptyParams = NULL;
+    if(!params)
+    {
+        emptyParams = json_object();
+        params = emptyParams;
+    }
+
     cmd_handler handler = get_handler(method);
     if(handler)
     {
-        handler(req, params ? params : json_object(), &resp);
+        handler(req, params, &resp);
+    }
+    else if(!method)
+    {
+        resp = build_error_response(id, "missing method");
     }
     else
     {
         resp = json_object();
-        json_object_set_new(resp, "id", json_string(id));
+        json_object_set_new(resp, "id", json_string_safe(id));
         json_object_set_new(resp, "error", json_string("unknown method"));
     }
 
@@ -1415,6 +1512,9 @@ static void process_request(json_t* req, char* out_buf, size_t out_buf_size)
         }
         json_decref(resp);
     }
+
+    if(emptyParams)
+        json_decref(emptyParams);
 }
 
 static DWORD WINAPI pipe_thread(LPVOID param)
@@ -1496,7 +1596,6 @@ extern "C" __declspec(dllexport) bool pluginit(PLUG_INITSTRUCT* initStruct)
     initStruct->pluginVersion = 1;
     strncpy(initStruct->pluginName, "MCP Bridge Plugin", 256);
     g_pluginHandle = initStruct->pluginHandle;
-    _plugin_registercallback(g_pluginHandle, CB_BREAKPOINT, bp_filter_callback);
     return true;
 }
 
