@@ -1,0 +1,477 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>x64dbg MCP Broker</title>
+  <style>
+    :root {
+      --bg: #f5f7fa;
+      --panel: #ffffff;
+      --panel-border: #d9dee7;
+      --text: #1f2937;
+      --muted: #667085;
+      --line: #e5e7eb;
+      --green: #137333;
+      --green-bg: #e7f4ec;
+      --blue: #175cd3;
+      --blue-bg: #eaf1ff;
+      --amber: #b54708;
+      --amber-bg: #fff4e5;
+      --red: #b42318;
+      --red-bg: #fee4e2;
+      --gray-bg: #eef2f6;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "Segoe UI", Arial, sans-serif;
+      letter-spacing: 0;
+    }
+
+    .shell {
+      width: min(1180px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 24px 0 32px;
+    }
+
+    header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 16px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 24px;
+      line-height: 1.2;
+      font-weight: 650;
+    }
+
+    .subtle {
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.4;
+      word-break: break-all;
+    }
+
+    .status-line {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      gap: 8px;
+      min-width: 220px;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      padding: 4px 9px;
+      border-radius: 999px;
+      background: var(--gray-bg);
+      color: var(--text);
+      font-size: 12px;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+
+    .pill.ok { background: var(--green-bg); color: var(--green); }
+    .pill.running { background: var(--blue-bg); color: var(--blue); }
+    .pill.paused { background: var(--amber-bg); color: var(--amber); }
+    .pill.error, .pill.stopped { background: var(--red-bg); color: var(--red); }
+    .pill.idle { background: var(--gray-bg); color: var(--muted); }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+
+    .metric {
+      min-height: 92px;
+      border: 1px solid var(--panel-border);
+      border-radius: 8px;
+      background: var(--panel);
+      padding: 14px;
+    }
+
+    .metric-label {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 600;
+      margin-bottom: 10px;
+    }
+
+    .metric-value {
+      font-size: 25px;
+      line-height: 1.15;
+      font-weight: 700;
+      overflow-wrap: anywhere;
+    }
+
+    .metric-foot {
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 12px;
+      overflow-wrap: anywhere;
+    }
+
+    section {
+      border: 1px solid var(--panel-border);
+      border-radius: 8px;
+      background: var(--panel);
+      margin-top: 14px;
+      overflow: hidden;
+    }
+
+    .section-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 13px 14px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    h2 {
+      margin: 0;
+      font-size: 15px;
+      line-height: 1.25;
+      font-weight: 650;
+    }
+
+    .table-wrap {
+      overflow-x: auto;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      table-layout: fixed;
+      min-width: 780px;
+    }
+
+    th, td {
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: middle;
+      font-size: 13px;
+      line-height: 1.35;
+    }
+
+    th {
+      color: var(--muted);
+      background: #f8fafc;
+      font-weight: 650;
+    }
+
+    tr:last-child td { border-bottom: 0; }
+
+    td {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    code {
+      display: inline-block;
+      max-width: 100%;
+      padding: 2px 5px;
+      border-radius: 4px;
+      background: #f1f3f7;
+      color: #344054;
+      font-family: Consolas, "Cascadia Mono", monospace;
+      font-size: 12px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      vertical-align: bottom;
+    }
+
+    .empty {
+      padding: 20px 14px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .error-box {
+      display: none;
+      margin-bottom: 14px;
+      border: 1px solid #fecdca;
+      border-radius: 8px;
+      background: #fff5f5;
+      color: var(--red);
+      padding: 12px 14px;
+      font-size: 13px;
+      overflow-wrap: anywhere;
+    }
+
+    .error-box.visible { display: block; }
+
+    @media (max-width: 820px) {
+      .shell { width: min(100% - 20px, 1180px); padding-top: 16px; }
+      header { display: block; }
+      .status-line { justify-content: flex-start; margin-top: 12px; }
+      .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+
+    @media (max-width: 520px) {
+      .metrics { grid-template-columns: 1fr; }
+      h1 { font-size: 21px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header>
+      <div>
+        <h1>x64dbg MCP Broker</h1>
+        <div id="endpoint" class="subtle">Loading broker endpoint...</div>
+      </div>
+      <div class="status-line">
+        <span id="broker-pill" class="pill idle">checking</span>
+        <span id="refresh-pill" class="pill idle">waiting</span>
+      </div>
+    </header>
+
+    <div id="error" class="error-box"></div>
+
+    <div class="metrics">
+      <div class="metric">
+        <div class="metric-label">Broker</div>
+        <div id="metric-broker" class="metric-value">-</div>
+        <div id="metric-version" class="metric-foot">version -</div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">Sessions</div>
+        <div id="metric-sessions" class="metric-value">0</div>
+        <div id="metric-active-session" class="metric-foot">no active alias</div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">Plugins</div>
+        <div id="metric-plugins" class="metric-value">0</div>
+        <div id="metric-plugin-state" class="metric-foot">no plugin state</div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">Last Update</div>
+        <div id="metric-time" class="metric-value">-</div>
+        <div id="metric-age" class="metric-foot">waiting for data</div>
+      </div>
+    </div>
+
+    <section>
+      <div class="section-head">
+        <h2>Sessions</h2>
+        <span id="sessions-pill" class="pill idle">0 total</span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th style="width: 90px;">Alias</th>
+              <th style="width: 110px;">State</th>
+              <th>Target</th>
+              <th style="width: 160px;">Plugin</th>
+              <th style="width: 190px;">Control URL</th>
+              <th style="width: 120px;">Last Seen</th>
+            </tr>
+          </thead>
+          <tbody id="sessions-body"></tbody>
+        </table>
+      </div>
+      <div id="sessions-empty" class="empty">No sessions registered.</div>
+    </section>
+
+    <section>
+      <div class="section-head">
+        <h2>Plugins</h2>
+        <span id="plugins-pill" class="pill idle">0 total</span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th style="width: 160px;">Plugin</th>
+              <th style="width: 90px;">PID</th>
+              <th style="width: 110px;">State</th>
+              <th style="width: 90px;">Port</th>
+              <th>Target</th>
+              <th style="width: 120px;">Last Seen</th>
+            </tr>
+          </thead>
+          <tbody id="plugins-body"></tbody>
+        </table>
+      </div>
+      <div id="plugins-empty" class="empty">No plugins registered.</div>
+    </section>
+  </main>
+
+  <script>
+    const API_BASE = window.location.protocol === "file:" ? "http://127.0.0.1:21463" : "";
+    const API_HEALTH = API_BASE + "/api/health";
+
+    const $ = id => document.getElementById(id);
+
+    function text(id, value) {
+      $(id).textContent = value == null || value === "" ? "-" : String(value);
+    }
+
+    function endpointLabel() {
+      return API_BASE ? API_HEALTH : window.location.origin + "/api/health";
+    }
+
+    function stateClass(state) {
+      const value = String(state || "idle").toLowerCase();
+      if (value === "running") return "running";
+      if (value === "paused") return "paused";
+      if (value === "stopped" || value === "error") return "error";
+      if (value === "ok") return "ok";
+      return "idle";
+    }
+
+    function setPill(id, label, state) {
+      const el = $(id);
+      el.className = "pill " + stateClass(state);
+      el.textContent = label;
+    }
+
+    function formatClock(value) {
+      if (!value) return "-";
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return String(value);
+      return date.toLocaleTimeString();
+    }
+
+    function age(value) {
+      if (!value) return "-";
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return "-";
+      const seconds = Math.max(0, Math.round((Date.now() - date.getTime()) / 1000));
+      if (seconds < 5) return "now";
+      if (seconds < 60) return seconds + "s ago";
+      const minutes = Math.round(seconds / 60);
+      if (minutes < 60) return minutes + "m ago";
+      return Math.round(minutes / 60) + "h ago";
+    }
+
+    function targetName(item) {
+      return item.target_hint || item.target_name || "";
+    }
+
+    function clearRows(tbody) {
+      while (tbody.firstChild) tbody.removeChild(tbody.firstChild);
+    }
+
+    function td(value, asCode) {
+      const cell = document.createElement("td");
+      if (asCode) {
+        const code = document.createElement("code");
+        code.textContent = value || "";
+        cell.appendChild(code);
+      } else {
+        cell.textContent = value || "";
+      }
+      cell.title = value || "";
+      return cell;
+    }
+
+    function badge(value) {
+      const cell = document.createElement("td");
+      const span = document.createElement("span");
+      span.className = "pill " + stateClass(value);
+      span.textContent = value || "idle";
+      cell.appendChild(span);
+      return cell;
+    }
+
+    function renderSessions(sessions) {
+      const tbody = $("sessions-body");
+      clearRows(tbody);
+      $("sessions-empty").style.display = sessions.length ? "none" : "block";
+      for (const item of sessions) {
+        const row = document.createElement("tr");
+        row.appendChild(td(item.alias || ""));
+        row.appendChild(badge(item.state || ""));
+        row.appendChild(td(targetName(item)));
+        row.appendChild(td(item.plugin_id || "", true));
+        row.appendChild(td(item.control_url || "", true));
+        row.appendChild(td(age(item.last_seen || item.registered_at)));
+        tbody.appendChild(row);
+      }
+    }
+
+    function renderPlugins(plugins) {
+      const tbody = $("plugins-body");
+      clearRows(tbody);
+      $("plugins-empty").style.display = plugins.length ? "none" : "block";
+      for (const item of plugins) {
+        const row = document.createElement("tr");
+        row.appendChild(td(item.plugin_id || "", true));
+        row.appendChild(td(item.pid || ""));
+        row.appendChild(badge(item.state || ""));
+        row.appendChild(td(item.control_port || ""));
+        row.appendChild(td(targetName(item)));
+        row.appendChild(td(age(item.last_seen)));
+        tbody.appendChild(row);
+      }
+    }
+
+    function summarizePluginState(plugins) {
+      if (!plugins.length) return "no plugin state";
+      const counts = plugins.reduce((acc, item) => {
+        const key = item.state || "idle";
+        acc[key] = (acc[key] || 0) + 1;
+        return acc;
+      }, {});
+      return Object.keys(counts).map(key => key + " " + counts[key]).join(", ");
+    }
+
+    async function refresh() {
+      $("endpoint").textContent = endpointLabel();
+      try {
+        const res = await fetch(API_HEALTH, { cache: "no-store" });
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const data = await res.json();
+        const sessions = Array.isArray(data.session_list) ? data.session_list : [];
+        const plugins = Array.isArray(data.plugin_list) ? data.plugin_list : [];
+
+        $("error").className = "error-box";
+        $("error").textContent = "";
+        setPill("broker-pill", data.broker || "running", "ok");
+        setPill("refresh-pill", "updated " + new Date().toLocaleTimeString(), "idle");
+        setPill("sessions-pill", sessions.length + " total", sessions.length ? "ok" : "idle");
+        setPill("plugins-pill", plugins.length + " total", plugins.length ? "ok" : "idle");
+
+        text("metric-broker", data.ok ? "running" : "error");
+        text("metric-version", "version " + (data.version || "-"));
+        text("metric-sessions", data.sessions ?? sessions.length);
+        text("metric-active-session", sessions.length ? "alias " + sessions.map(s => s.alias || "-").join(", ") : "no active alias");
+        text("metric-plugins", data.plugins ?? plugins.length);
+        text("metric-plugin-state", summarizePluginState(plugins));
+        text("metric-time", formatClock(data.time));
+        text("metric-age", age(data.time));
+
+        renderSessions(sessions);
+        renderPlugins(plugins);
+      } catch (err) {
+        setPill("broker-pill", "unreachable", "error");
+        setPill("refresh-pill", "retrying", "paused");
+        $("error").className = "error-box visible";
+        $("error").textContent = "Cannot read " + API_HEALTH + ": " + err.message;
+      }
+    }
+
+    refresh();
+    setInterval(refresh, 2000);
+  </script>
+</body>
+</html>

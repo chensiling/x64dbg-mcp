@@ -3,9 +3,12 @@
 
 #include <stdint.h>
 
-#define PIPE_NAME     L"\\\\.\\pipe\\x64dbg_mcp_bridge"
-#define PIPE_NAME_STR "\\\\.\\pipe\\x64dbg_mcp_bridge"
-#define PIPE_BUFFER_SIZE (256 * 1024)
+#define HTTP_HOST "127.0.0.1"
+#define HTTP_PORT_START 21464
+#define HTTP_PORT_END 21564
+#define HTTP_BUFFER_SIZE (256 * 1024)
+#define HTTP_INSTANCE_ROOT "x64dbg-mcp"
+#define HTTP_INSTANCE_DIR "instances"
 #define MAX_COMMAND_SIZE (64 * 1024)
 
 #define CMD_READ_MEMORY       "read_memory"
@@ -17,6 +20,10 @@
 #define CMD_SET_BREAKPOINT    "set_breakpoint"
 #define CMD_DELETE_BREAKPOINT "delete_breakpoint"
 #define CMD_TOGGLE_BREAKPOINT "toggle_breakpoint"
+#define CMD_GET_BREAKPOINT_CONDITION    "get_breakpoint_condition"
+#define CMD_SET_BREAKPOINT_CONDITION    "set_breakpoint_condition"
+#define CMD_APPEND_BREAKPOINT_CONDITION "append_breakpoint_condition"
+#define CMD_CLEAR_BREAKPOINT_CONDITION  "clear_breakpoint_condition"
 #define CMD_GET_DEBUG_STATE   "get_debug_state"
 #define CMD_RUN               "run"
 #define CMD_PAUSE             "pause"

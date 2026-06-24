@@ -22,6 +22,10 @@ TOOL_TO_CMD: dict[str, str] = {
     "breakpoint_set": "set_breakpoint",
     "breakpoint_delete": "delete_breakpoint",
     "breakpoint_toggle": "toggle_breakpoint",
+    "breakpoint_condition_get": "get_breakpoint_condition",
+    "breakpoint_condition_set": "set_breakpoint_condition",
+    "breakpoint_condition_append": "append_breakpoint_condition",
+    "breakpoint_condition_clear": "clear_breakpoint_condition",
     "debug_run": "run",
     "debug_pause": "pause",
     "debug_stop": "stop",
@@ -35,7 +39,7 @@ TOOL_TO_CMD: dict[str, str] = {
     "find_bytes": "find_bytes",
     "get_function_info": "get_function_info",
     "get_xrefs": "get_xrefs",
-    "set_bp_filter": "set_bp_filter",
+    "set_bp_filter": "set_breakpoint_condition",
     "modules_get": "get_modules",
     "module_info": "get_module_info",
     "symbols_get": "get_symbols",
@@ -79,7 +83,7 @@ TOOL_DEFINITIONS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "disassemble",
-        "description": "Disassemble instructions. Use count or end address.",
+        "description": "Disassemble instructions with machine-code bytes, symbolized labels, and a human-readable text block. Use count or end address.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -127,6 +131,68 @@ TOOL_DEFINITIONS: tuple[dict[str, Any], ...] = (
     },
     {"name": "breakpoint_delete", "description": "Delete a breakpoint.", "inputSchema": {"type": "object", "properties": {"addr": REQUIRED_ADDRESS}, "required": ["addr"]}},
     {"name": "breakpoint_toggle", "description": "Toggle a breakpoint on/off.", "inputSchema": {"type": "object", "properties": {"addr": REQUIRED_ADDRESS}, "required": ["addr"]}},
+    {
+        "name": "breakpoint_condition_get",
+        "description": "Read the native x64dbg break condition for a breakpoint.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "addr": REQUIRED_ADDRESS,
+                "type": {"type": "string", "enum": ["auto", "normal", "hardware", "memory", "dll", "exception"], "default": "auto", "description": "Breakpoint type. auto searches common types at the address."},
+            },
+            "required": ["addr"],
+        },
+    },
+    {
+        "name": "breakpoint_condition_set",
+        "description": "Set the native x64dbg break condition for an existing breakpoint.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "addr": REQUIRED_ADDRESS,
+                "type": {"type": "string", "enum": ["auto", "normal", "hardware", "memory", "dll", "exception"], "default": "auto", "description": "Breakpoint type. auto searches common types at the address."},
+                "condition": {"type": "string", "description": "x64dbg expression. Non-zero = break. Supports registers, memory, arithmetic, and x64dbg expression functions."},
+                "conditions": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Multiple x64dbg expressions to combine into one break condition.",
+                },
+                "op": {"type": "string", "enum": ["and", "or"], "default": "and", "description": "How to combine conditions when conditions is provided."},
+            },
+            "required": ["addr"],
+        },
+    },
+    {
+        "name": "breakpoint_condition_append",
+        "description": "Append one or more expressions to an existing x64dbg break condition.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "addr": REQUIRED_ADDRESS,
+                "type": {"type": "string", "enum": ["auto", "normal", "hardware", "memory", "dll", "exception"], "default": "auto", "description": "Breakpoint type. auto searches common types at the address."},
+                "condition": {"type": "string", "description": "x64dbg expression to append."},
+                "conditions": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Multiple x64dbg expressions to append.",
+                },
+                "op": {"type": "string", "enum": ["and", "or"], "default": "and", "description": "How to combine existing and new conditions."},
+            },
+            "required": ["addr"],
+        },
+    },
+    {
+        "name": "breakpoint_condition_clear",
+        "description": "Clear the native x64dbg break condition from a breakpoint.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "addr": REQUIRED_ADDRESS,
+                "type": {"type": "string", "enum": ["auto", "normal", "hardware", "memory", "dll", "exception"], "default": "auto", "description": "Breakpoint type. auto searches common types at the address."},
+            },
+            "required": ["addr"],
+        },
+    },
     {"name": "debug_run", "description": "Run (continue) the debugged process.", "inputSchema": {"type": "object", "properties": {}}},
     {"name": "debug_pause", "description": "Pause the debugged process.", "inputSchema": {"type": "object", "properties": {}}},
     {"name": "debug_stop", "description": "Stop debugging.", "inputSchema": {"type": "object", "properties": {}}},
@@ -147,7 +213,20 @@ TOOL_DEFINITIONS: tuple[dict[str, Any], ...] = (
         "inputSchema": {"type": "object", "properties": {"expression": {"type": "string", "description": "Expression ('eip+0x10', '[eax]', 'kernel32.GetProcAddress')."}}, "required": ["expression"]},
     },
     {"name": "memory_map", "description": "Get virtual memory map of the debugged process.", "inputSchema": {"type": "object", "properties": {}}},
-    {"name": "call_stack", "description": "Get the call stack.", "inputSchema": {"type": "object", "properties": {}}},
+    {
+        "name": "call_stack",
+        "description": "Get the call stack with module/symbol details and optional stack words.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "stack_words": {
+                    "type": "string",
+                    "default": "4",
+                    "description": "Number of pointer-sized stack values to include for each frame (0-16).",
+                },
+            },
+        },
+    },
     {"name": "label_get", "description": "Get a label at an address.", "inputSchema": {"type": "object", "properties": {"addr": REQUIRED_ADDRESS}, "required": ["addr"]}},
     {"name": "label_set", "description": "Set a label at an address.", "inputSchema": {"type": "object", "properties": {"addr": REQUIRED_ADDRESS, "label": {"type": "string", "description": "Label text."}}, "required": ["addr", "label"]}},
     {"name": "comment_get", "description": "Get a comment at an address.", "inputSchema": {"type": "object", "properties": {"addr": REQUIRED_ADDRESS}, "required": ["addr"]}},

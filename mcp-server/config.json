@@ -1,0 +1,8 @@
+{
+  "broker_url": "http://127.0.0.1:21463",
+  "python_path": "python",
+  "server_script": "server.py",
+  "watchdog_interval_ms": 3000,
+  "watchdog_failures_before_notify": 3,
+  "auto_restart_broker": true
+}

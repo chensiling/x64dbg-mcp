@@ -1,3 +1,8 @@
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <Windows.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -8,10 +13,40 @@
 #include "../pluginsdk/jansson/jansson.h"
 #include "protocol.h"
 
-static HANDLE g_hPipeThread = NULL;
+static HANDLE g_hHttpThread = NULL;
+static HANDLE g_hWatchdogThread = NULL;
+static HANDLE g_hBrokerProcess = NULL;
+static SOCKET g_listenSocket = INVALID_SOCKET;
 static volatile LONG g_running = 0;
 static int g_pluginHandle = 0;
+static HMODULE g_hModule = NULL;
 static bool g_consoleAllocated = false;
+static unsigned short g_httpPort = 0;
+static char g_instanceFile[MAX_PATH] = {0};
+static volatile LONG g_sessionRegistered = 0;
+
+struct broker_config
+{
+    char brokerUrl[256];
+    char pythonPath[MAX_PATH];
+    char serverScript[MAX_PATH];
+    char webRoot[MAX_PATH];
+    DWORD watchdogIntervalMs;
+    int failuresBeforeNotify;
+    bool autoRestartBroker;
+};
+
+static broker_config g_brokerConfig = {
+    "http://127.0.0.1:21463",
+    "python",
+    "",
+    "",
+    3000,
+    3,
+    true,
+};
+
+static bool send_all(SOCKET sock, const char* data, int len);
 
 static void hex_encode(const unsigned char* data, size_t len, char* out)
 {
@@ -50,7 +85,7 @@ static void init_console()
         SetConsoleTitleW(L"x64dbg MCP Bridge");
         printf("========================================\n");
         printf("  x64dbg MCP Bridge Plugin Console\n");
-        printf("  Pipe: %s\n", PIPE_NAME_STR);
+        printf("  HTTP: pending\n");
         printf("========================================\n\n");
     }
 }
@@ -182,6 +217,39 @@ static bool append_condition_expr(char* out, size_t outSize, const char* text, c
     return true;
 }
 
+static bool get_condition_joiner(json_t* params, const char** outJoiner, const char** outOp, char* err, size_t errSize)
+{
+    json_t* opValue = json_object_get(params, "op");
+    const char* op = NULL;
+    if(opValue)
+    {
+        if(!json_is_string(opValue))
+        {
+            snprintf(err, errSize, "op must be 'and' or 'or'");
+            return false;
+        }
+        op = json_string_value(opValue);
+    }
+    if(!op || !op[0])
+        op = "and";
+
+    if(_stricmp(op, "and") == 0)
+    {
+        *outJoiner = "&&";
+        *outOp = "and";
+        return true;
+    }
+    if(_stricmp(op, "or") == 0)
+    {
+        *outJoiner = "||";
+        *outOp = "or";
+        return true;
+    }
+
+    snprintf(err, errSize, "op must be 'and' or 'or'");
+    return false;
+}
+
 static bool build_break_condition(json_t* params, char* out, size_t outSize, char* err, size_t errSize)
 {
     out[0] = '\0';
@@ -200,7 +268,7 @@ static bool build_break_condition(json_t* params, char* out, size_t outSize, cha
 
     if(!conditionsValue)
     {
-        snprintf(err, errSize, "set_bp_filter requires condition or conditions");
+        snprintf(err, errSize, "condition or conditions is required");
         return false;
     }
     if(!json_is_array(conditionsValue) || json_array_size(conditionsValue) == 0)
@@ -209,20 +277,10 @@ static bool build_break_condition(json_t* params, char* out, size_t outSize, cha
         return false;
     }
 
-    const char* op = json_string_value(json_object_get(params, "op"));
-    if(!op || !op[0])
-        op = "and";
-
     const char* joiner = NULL;
-    if(_stricmp(op, "and") == 0)
-        joiner = "&&";
-    else if(_stricmp(op, "or") == 0)
-        joiner = "||";
-    else
-    {
-        snprintf(err, errSize, "op must be 'and' or 'or'");
+    const char* normalizedOp = NULL;
+    if(!get_condition_joiner(params, &joiner, &normalizedOp, err, errSize))
         return false;
-    }
 
     size_t count = json_array_size(conditionsValue);
     for(size_t i = 0; i < count; i++)
@@ -244,6 +302,178 @@ static bool build_break_condition(json_t* params, char* out, size_t outSize, cha
             return false;
     }
     return true;
+}
+
+static const char* bp_type_to_string(BPXTYPE type)
+{
+    switch(type)
+    {
+    case bp_normal: return "normal";
+    case bp_hardware: return "hardware";
+    case bp_memory: return "memory";
+    case bp_dll: return "dll";
+    case bp_exception: return "exception";
+    default: return "unknown";
+    }
+}
+
+static bool get_bp_type_param(json_t* params, BPXTYPE* out, char* err, size_t errSize)
+{
+    json_t* typeValue = json_object_get(params, "type");
+    if(!typeValue)
+    {
+        *out = bp_none;
+        return true;
+    }
+    if(!json_is_string(typeValue))
+    {
+        snprintf(err, errSize, "type must be auto, normal, hardware, memory, dll, or exception");
+        return false;
+    }
+
+    const char* type = json_string_value(typeValue);
+    if(!type || !type[0] || _stricmp(type, "auto") == 0)
+        *out = bp_none;
+    else if(_stricmp(type, "normal") == 0)
+        *out = bp_normal;
+    else if(_stricmp(type, "hardware") == 0)
+        *out = bp_hardware;
+    else if(_stricmp(type, "memory") == 0)
+        *out = bp_memory;
+    else if(_stricmp(type, "dll") == 0)
+        *out = bp_dll;
+    else if(_stricmp(type, "exception") == 0)
+        *out = bp_exception;
+    else
+    {
+        snprintf(err, errSize, "type must be auto, normal, hardware, memory, dll, or exception");
+        return false;
+    }
+    return true;
+}
+
+static bool resolve_bp_ref(duint addr, BPXTYPE requestedType, BP_REF* ref, BPXTYPE* actualType)
+{
+    const DBGFUNCTIONS* funcs = DbgFunctions();
+    if(!funcs || !funcs->BpRefVa)
+        return false;
+
+    if(requestedType != bp_none)
+    {
+        memset(ref, 0, sizeof(*ref));
+        if(funcs->BpRefVa(ref, requestedType, addr))
+        {
+            if(actualType)
+                *actualType = requestedType;
+            return true;
+        }
+        return false;
+    }
+
+    static const BPXTYPE preferredTypes[] = {
+        bp_normal, bp_hardware, bp_memory, bp_dll, bp_exception
+    };
+    for(size_t i = 0; i < sizeof(preferredTypes) / sizeof(preferredTypes[0]); i++)
+    {
+        memset(ref, 0, sizeof(*ref));
+        if(funcs->BpRefVa(ref, preferredTypes[i], addr))
+        {
+            if(actualType)
+                *actualType = preferredTypes[i];
+            return true;
+        }
+    }
+    return false;
+}
+
+struct text_capture
+{
+    char* value;
+    size_t valueSize;
+};
+
+static void capture_text_callback(const char* text, void* userdata)
+{
+    text_capture* capture = (text_capture*)userdata;
+    if(!capture || !capture->value || capture->valueSize == 0)
+        return;
+    snprintf(capture->value, capture->valueSize, "%s", text ? text : "");
+}
+
+static bool read_break_condition(duint addr, BPXTYPE requestedType, char* out, size_t outSize, BPXTYPE* actualType)
+{
+    const DBGFUNCTIONS* funcs = DbgFunctions();
+    if(!funcs || !funcs->BpGetFieldText)
+        return false;
+
+    BP_REF ref = {0};
+    BPXTYPE foundType = bp_none;
+    if(!resolve_bp_ref(addr, requestedType, &ref, &foundType))
+        return false;
+
+    out[0] = '\0';
+    text_capture capture = { out, outSize };
+    if(!funcs->BpGetFieldText(&ref, bpf_breakcondition, capture_text_callback, &capture))
+        return false;
+
+    if(actualType)
+        *actualType = foundType;
+    return true;
+}
+
+static bool write_break_condition(duint addr, BPXTYPE requestedType, const char* condition, BPXTYPE* actualType, char* err, size_t errSize)
+{
+    const DBGFUNCTIONS* funcs = DbgFunctions();
+    if(!funcs || !funcs->BpSetFieldText)
+    {
+        snprintf(err, errSize, "breakpoint field API is unavailable");
+        return false;
+    }
+
+    BP_REF ref = {0};
+    BPXTYPE foundType = bp_none;
+    if(!resolve_bp_ref(addr, requestedType, &ref, &foundType))
+    {
+        snprintf(err, errSize, "breakpoint not found at address");
+        return false;
+    }
+
+    if(!funcs->BpSetFieldText(&ref, bpf_breakcondition, condition ? condition : ""))
+    {
+        snprintf(err, errSize, "failed to set breakpoint condition");
+        return false;
+    }
+
+    GuiUpdateBreakpointsView();
+    if(actualType)
+        *actualType = foundType;
+    return true;
+}
+
+static bool combine_break_conditions(const char* left, const char* right, json_t* params, char* out, size_t outSize, const char** outOp, char* err, size_t errSize)
+{
+    out[0] = '\0';
+    const char* l = left ? left : "";
+    const char* r = right ? right : "";
+    if(!l[0])
+        return append_condition_expr(out, outSize, r, err, errSize);
+    if(!r[0])
+        return append_condition_expr(out, outSize, l, err, errSize);
+
+    const char* joiner = NULL;
+    const char* normalizedOp = NULL;
+    if(!get_condition_joiner(params, &joiner, &normalizedOp, err, errSize))
+        return false;
+    if(outOp)
+        *outOp = normalizedOp;
+
+    return append_condition_expr(out, outSize, "(", err, errSize) &&
+        append_condition_expr(out, outSize, l, err, errSize) &&
+        append_condition_expr(out, outSize, ")", err, errSize) &&
+        append_condition_expr(out, outSize, joiner, err, errSize) &&
+        append_condition_expr(out, outSize, "(", err, errSize) &&
+        append_condition_expr(out, outSize, r, err, errSize) &&
+        append_condition_expr(out, outSize, ")", err, errSize);
 }
 
 static void handle_read_memory(json_t* req, json_t* params, json_t** out_resp)
@@ -299,6 +529,102 @@ static void handle_write_memory(json_t* req, json_t* params, json_t** out_resp)
     *out_resp = build_value_response(id, data);
 }
 
+static json_t* describe_disasm_address(duint addr, char* outDisplay, size_t displaySize, char* outSymbol, size_t symbolSize)
+{
+    char addressText[32] = {0};
+    snprintf(addressText, sizeof(addressText), "%016llX", (unsigned long long)addr);
+    if(outDisplay && displaySize)
+        snprintf(outDisplay, displaySize, "%s", addressText);
+    if(outSymbol && symbolSize)
+        outSymbol[0] = '\0';
+
+    json_t* details = json_object();
+    json_object_set_new(details, "address", addr_json(addr));
+    json_object_set_new(details, "address_text", json_string(addressText));
+
+    const DBGFUNCTIONS* funcs = DbgFunctions();
+    duint base = funcs && funcs->ModBaseFromAddr ? funcs->ModBaseFromAddr(addr) : 0;
+    char module[MAX_MODULE_SIZE] = {0};
+    if(base && funcs && funcs->ModNameFromAddr)
+    {
+        funcs->ModNameFromAddr(addr, module, false);
+        json_object_set_new(details, "module", json_string(module));
+        json_object_set_new(details, "module_base", addr_json(base));
+        json_object_set_new(details, "rva", addr_json(addr - base));
+    }
+
+    bool hasSymbol = false;
+    char qualified[512] = {0};
+    SYMBOLINFO sym = {0};
+    if(DbgGetSymbolInfoAt(addr, &sym))
+    {
+        const char* name = sym.undecoratedSymbol && sym.undecoratedSymbol[0] ? sym.undecoratedSymbol : sym.decoratedSymbol;
+        if(name && name[0])
+        {
+            hasSymbol = true;
+            duint displacement = addr >= sym.addr ? addr - sym.addr : 0;
+            if(module[0])
+                snprintf(qualified, sizeof(qualified), "%s.%s", module, name);
+            else
+                snprintf(qualified, sizeof(qualified), "%s", name);
+            if(displacement)
+                snprintf(qualified + strlen(qualified), sizeof(qualified) - strlen(qualified), "+0x%llX", (unsigned long long)displacement);
+
+            json_object_set_new(details, "symbol", json_string(qualified));
+            json_object_set_new(details, "symbol_name", json_string(name));
+            json_object_set_new(details, "symbol_addr", addr_json(sym.addr));
+            json_object_set_new(details, "symbol_displacement", addr_json(displacement));
+            json_object_set_new(details, "symbol_ordinal", json_integer(sym.ordinal));
+            if(sym.decoratedSymbol && sym.decoratedSymbol[0])
+                json_object_set_new(details, "decorated", json_string(sym.decoratedSymbol));
+            if(sym.undecoratedSymbol && sym.undecoratedSymbol[0])
+                json_object_set_new(details, "undecorated", json_string(sym.undecoratedSymbol));
+        }
+        if(sym.freeDecorated && sym.decoratedSymbol)
+            BridgeFree(sym.decoratedSymbol);
+        if(sym.freeUndecorated && sym.undecoratedSymbol)
+            BridgeFree(sym.undecoratedSymbol);
+    }
+
+    char label[MAX_LABEL_SIZE] = {0};
+    if(!hasSymbol && DbgGetLabelAt(addr, SEG_DEFAULT, label) && label[0])
+    {
+        if(module[0])
+            snprintf(qualified, sizeof(qualified), "%s.%s", module, label);
+        else
+            snprintf(qualified, sizeof(qualified), "%s", label);
+        json_object_set_new(details, "symbol", json_string(qualified));
+        json_object_set_new(details, "label", json_string(label));
+        hasSymbol = true;
+    }
+
+    char comment[MAX_COMMENT_SIZE] = {0};
+    if(DbgGetCommentAt(addr, comment) && comment[0])
+        json_object_set_new(details, "comment", json_string(comment));
+
+    char display[640] = {0};
+    if(hasSymbol && qualified[0])
+    {
+        snprintf(display, sizeof(display), "%s <%s>", addressText, qualified);
+        if(outSymbol && symbolSize)
+            snprintf(outSymbol, symbolSize, "%s", qualified);
+    }
+    else if(module[0] && base)
+    {
+        snprintf(qualified, sizeof(qualified), "%s+0x%llX", module, (unsigned long long)(addr - base));
+        snprintf(display, sizeof(display), "%s <%s>", addressText, qualified);
+    }
+    else
+    {
+        snprintf(display, sizeof(display), "%s", addressText);
+    }
+    json_object_set_new(details, "display", json_string(display));
+    if(outDisplay && displaySize)
+        snprintf(outDisplay, displaySize, "%s", display);
+
+    return details;
+}
+
 static void handle_disassemble(json_t* req, json_t* params, json_t** out_resp)
 {
     const char* id = json_string_value(json_object_get(req, "id"));
@@ -321,6 +647,21 @@ static void handle_disassemble(json_t* req, json_t* params, json_t** out_resp)
     if(count > 256) count = 256;
 
     json_t* instructions = json_array();
+    char* text = (char*)BridgeAlloc(HTTP_BUFFER_SIZE);
+    size_t textLen = 0;
+    if(text)
+    {
+        textLen += snprintf(text + textLen, HTTP_BUFFER_SIZE - textLen,
+            "%-56s  %-30s  %s\n",
+            "Address / Symbol",
+            "Bytes",
+            "Instruction");
+        textLen += snprintf(text + textLen, HTTP_BUFFER_SIZE - textLen,
+            "%-56s  %-30s  %s\n",
+            "--------------------------------------------------------",
+            "------------------------------",
+            "----------------");
+    }
     duint cur = addr;
     int i = 0;
     while(i < (int)count && (!endAddr || cur < endAddr))
@@ -332,16 +673,64 @@ static void handle_disassemble(json_t* req, json_t* params, json_t** out_resp)
         DbgDisasmAt(cur, &instr);
 
         json_t* entry = json_object();
+        char display[640] = {0};
+        char symbol[512] = {0};
+        char addressText[32] = {0};
+        snprintf(addressText, sizeof(addressText), "%016llX", (unsigned long long)cur);
+        json_t* symbolDetails = describe_disasm_address(cur, display, sizeof(display), symbol, sizeof(symbol));
         json_object_set_new(entry, "address", addr_json(cur));
+        json_object_set_new(entry, "address_text", json_string(addressText));
+        json_object_set_new(entry, "display", json_string(display[0] ? display : ""));
+        if(symbol[0])
+            json_object_set_new(entry, "symbol", json_string(symbol));
+        json_object_set_new(entry, "symbol_details", symbolDetails);
         json_object_set_new(entry, "instruction", json_string(instr.instruction));
         json_object_set_new(entry, "size", addr_json(basicinfo.size));
+        char bytesText[96] = {0};
+        if(basicinfo.size > 0 && basicinfo.size <= 32)
+        {
+            unsigned char bytes[32] = {0};
+            bool bytesOk = DbgMemRead(cur, bytes, basicinfo.size);
+            json_object_set_new(entry, "bytes_ok", json_boolean(bytesOk));
+            if(bytesOk)
+            {
+                char hex[65] = {0};
+                char spaced[96] = {0};
+                hex_encode(bytes, basicinfo.size, hex);
+                for(int j = 0; j < basicinfo.size; j++)
+                {
+                    char* out = spaced + j * 3;
+                    if(j + 1 < basicinfo.size)
+                        snprintf(out, 4, "%02X ", bytes[j]);
+                    else
+                        snprintf(out, 3, "%02X", bytes[j]);
+                }
+                json_object_set_new(entry, "bytes", json_string(hex));
+                json_object_set_new(entry, "bytes_text", json_string(spaced));
+                snprintf(bytesText, sizeof(bytesText), "%s", spaced);
+            }
+        }
         if(basicinfo.branch)
         {
             json_object_set_new(entry, "branch", json_true());
             json_object_set_new(entry, "branch_dest", addr_json(basicinfo.addr));
         }
+
+        char line[1024] = {0};
+        snprintf(line, sizeof(line), "%-56s  %-30s  %s",
+            display[0] ? display : addressText,
+            bytesText,
+            instr.instruction);
+        json_object_set_new(entry, "line", json_string(line));
+        if(text && textLen < HTTP_BUFFER_SIZE - 2)
+        {
+            int written = snprintf(text + textLen, HTTP_BUFFER_SIZE - textLen, "%s\n", line);
+            if(written > 0)
+                textLen += (size_t)written < HTTP_BUFFER_SIZE - textLen ? (size_t)written : HTTP_BUFFER_SIZE - textLen - 1;
+        }
         json_array_append_new(instructions, entry);
 
+        i++;
         if(basicinfo.size <= 0)
             break;
         cur += basicinfo.size;
@@ -350,6 +739,11 @@ static void handle_disassemble(json_t* req, json_t* params, json_t** out_resp)
     json_t* data = json_object();
     json_object_set_new(data, "address", addr_json(addr));
     json_object_set_new(data, "count", addr_json(count));
+    if(text)
+    {
+        json_object_set_new(data, "text", json_string(text));
+        BridgeFree(text);
+    }
     json_object_set_new(data, "instructions", instructions);
     *out_resp = build_value_response(id, data);
 }
@@ -886,10 +1280,57 @@ static void handle_get_memory_map(json_t* req, json_t* params, json_t** out_resp
     *out_resp = build_value_response(id, data);
 }
 
+static json_t* describe_stack_address(duint addr)
+{
+    json_t* details = json_object();
+    json_object_set_new(details, "address", addr_json(addr));
+
+    if(!addr)
+    {
+        json_object_set_new(details, "display", json_string(""));
+        return details;
+    }
+
+    const DBGFUNCTIONS* funcs = DbgFunctions();
+    duint base = funcs && funcs->ModBaseFromAddr ? funcs->ModBaseFromAddr(addr) : 0;
+    char module[MAX_MODULE_SIZE] = {0};
+    char label[MAX_LABEL_SIZE] = {0};
+    char comment[MAX_COMMENT_SIZE] = {0};
+
+    if(base && funcs && funcs->ModNameFromAddr)
+    {
+        funcs->ModNameFromAddr(addr, module, true);
+        json_object_set_new(details, "module", json_string(module));
+        json_object_set_new(details, "module_base", addr_json(base));
+        json_object_set_new(details, "rva", addr_json(addr - base));
+    }
+
+    if(DbgGetLabelAt(addr, SEG_DEFAULT, label) && label[0])
+        json_object_set_new(details, "label", json_string(label));
+    if(DbgGetCommentAt(addr, comment) && comment[0])
+        json_object_set_new(details, "comment", json_string(comment));
+
+    char display[512] = {0};
+    if(module[0] && label[0])
+        snprintf(display, sizeof(display), "%s.%s", module, label);
+    else if(module[0] && base)
+        snprintf(display, sizeof(display), "%s+0x%llX", module, (unsigned long long)(addr - base));
+    else if(label[0])
+        snprintf(display, sizeof(display), "%s", label);
+    else
+        snprintf(display, sizeof(display), "0x%llX", (unsigned long long)addr);
+    json_object_set_new(details, "display", json_string(display));
+
+    return details;
+}
+
 static void handle_get_call_stack(json_t* req, json_t* params, json_t** out_resp)
 {
-    (void)params;
     const char* id = json_string_value(json_object_get(req, "id"));
+    duint stackWords = 4;
+    get_int_param(params, "stack_words", 4, &stackWords);
+    if(stackWords > 16)
+        stackWords = 16;
 
     DBGCALLSTACK cs = {0};
     DbgFunctions()->GetCallStack(&cs);
@@ -903,11 +1344,42 @@ static void handle_get_call_stack(json_t* req, json_t* params, json_t** out_resp
         json_object_set_new(frame, "to", addr_json(cs.entries[i].to));
         if(cs.entries[i].comment[0])
             json_object_set_new(frame, "comment", json_string(cs.entries[i].comment));
+
+        json_object_set_new(frame, "index", json_integer(i));
+        json_object_set_new(frame, "current", json_boolean(i == 0));
+        json_object_set_new(frame, "stack_addr", addr_json(cs.entries[i].addr));
+        json_object_set_new(frame, "return_to", addr_json(cs.entries[i].to));
+        json_object_set_new(frame, "from_details", describe_stack_address(cs.entries[i].from));
+        json_object_set_new(frame, "to_details", describe_stack_address(cs.entries[i].to));
+        if(i + 1 < cs.total && cs.entries[i + 1].addr > cs.entries[i].addr)
+        {
+            json_object_set_new(frame, "next_stack_addr", addr_json(cs.entries[i + 1].addr));
+            json_object_set_new(frame, "frame_size", addr_json(cs.entries[i + 1].addr - cs.entries[i].addr));
+        }
+
+        json_t* stack = json_array();
+        for(duint word = 0; word < stackWords; word++)
+        {
+            duint stackAddr = cs.entries[i].addr + word * sizeof(duint);
+            duint value = 0;
+            bool ok = DbgMemRead(stackAddr, &value, sizeof(value));
+            json_t* item = json_object();
+            json_object_set_new(item, "addr", addr_json(stackAddr));
+            json_object_set_new(item, "value", addr_json(value));
+            json_object_set_new(item, "ok", json_boolean(ok));
+            if(ok)
+                json_object_set_new(item, "details", describe_stack_address(value));
+            json_array_append_new(stack, item);
+        }
+        json_object_set_new(frame, "stack_words", stack);
+
         json_array_append_new(frames, frame);
     }
     if(cs.entries) BridgeFree(cs.entries);
 
     json_t* data = json_object();
+    json_object_set_new(data, "total", json_integer(cs.total));
+    json_object_set_new(data, "stack_words", addr_json(stackWords));
     json_object_set_new(data, "callstack", frames);
     *out_resp = build_value_response(id, data);
 }
@@ -1085,19 +1557,75 @@ static void handle_get_threads(json_t* req, json_t* params, json_t** out_resp)
     *out_resp = build_value_response(id, data);
 }
 
-static void handle_set_bp_filter(json_t* req, json_t* params, json_t** out_resp)
+static void handle_get_breakpoint_condition(json_t* req, json_t* params, json_t** out_resp)
 {
     const char* id = json_string_value(json_object_get(req, "id"));
     duint addr = 0;
     if(!get_addr_param(params, "addr", &addr))
     {
-        *out_resp = build_error_response(id, "set_bp_filter requires addr");
+        *out_resp = build_error_response(id, "get_breakpoint_condition requires addr");
+        return;
+    }
+
+    BPXTYPE requestedType = bp_none;
+    char error[256] = {0};
+    if(!get_bp_type_param(params, &requestedType, error, sizeof(error)))
+    {
+        *out_resp = build_error_response(id, error);
         return;
     }
 
     char condition[MAX_CONDITIONAL_EXPR_SIZE] = {0};
+    BPXTYPE actualType = bp_none;
+    if(!read_break_condition(addr, requestedType, condition, sizeof(condition), &actualType))
+    {
+        *out_resp = build_error_response(id, "breakpoint not found at address");
+        return;
+    }
+
+    json_t* data = json_object();
+    json_object_set_new(data, "ok", json_true());
+    json_object_set_new(data, "addr", addr_json(addr));
+    json_object_set_new(data, "type", json_string(bp_type_to_string(actualType)));
+    json_object_set_new(data, "condition", json_string(condition));
+    json_object_set_new(data, "has_condition", json_boolean(condition[0] != '\0'));
+    *out_resp = build_value_response(id, data);
+}
+
+static void handle_set_breakpoint_condition(json_t* req, json_t* params, json_t** out_resp)
+{
+    const char* id = json_string_value(json_object_get(req, "id"));
+    duint addr = 0;
+    if(!get_addr_param(params, "addr", &addr))
+    {
+        *out_resp = build_error_response(id, "set_breakpoint_condition requires addr");
+        return;
+    }
+
+    BPXTYPE requestedType = bp_none;
     char error[256] = {0};
+    if(!get_bp_type_param(params, &requestedType, error, sizeof(error)))
+    {
+        *out_resp = build_error_response(id, error);
+        return;
+    }
+
+    char condition[MAX_CONDITIONAL_EXPR_SIZE] = {0};
     if(!build_break_condition(params, condition, sizeof(condition), error, sizeof(error)))
+    {
+        *out_resp = build_error_response(id, error);
+        return;
+    }
+
+    char previous[MAX_CONDITIONAL_EXPR_SIZE] = {0};
+    BPXTYPE actualType = bp_none;
+    if(!read_break_condition(addr, requestedType, previous, sizeof(previous), &actualType))
+    {
+        *out_resp = build_error_response(id, "breakpoint not found at address");
+        return;
+    }
+
+    if(!write_break_condition(addr, actualType, condition, &actualType, error, sizeof(error)))
     {
         *out_resp = build_error_response(id, error);
         return;
@@ -1105,23 +1633,140 @@ static void handle_set_bp_filter(json_t* req, json_t* params, json_t** out_resp)
 
     char cmd[512];
     snprintf(cmd, sizeof(cmd), "bpcnd %llX,%s", (unsigned long long)addr, condition);
-    bool ok = DbgCmdExecDirect(cmd);
-    log_msg("[BP Filter] Set native condition on %llX -> %s", (unsigned long long)addr, condition);
+    log_msg("[BP Condition] Set %s breakpoint condition on %llX -> %s",
+        bp_type_to_string(actualType), (unsigned long long)addr, condition);
 
     json_t* data = json_object();
-    json_object_set_new(data, "ok", json_boolean(ok));
+    json_object_set_new(data, "ok", json_true());
     json_object_set_new(data, "addr", addr_json(addr));
+    json_object_set_new(data, "type", json_string(bp_type_to_string(actualType)));
     json_object_set_new(data, "condition", json_string(condition));
+    json_object_set_new(data, "previous_condition", json_string(previous));
+    json_object_set_new(data, "has_condition", json_true());
     const char* responseOp = "";
     if(json_object_get(params, "conditions"))
     {
-        responseOp = json_string_value(json_object_get(params, "op"));
-        if(!responseOp || !responseOp[0])
-            responseOp = "and";
+        const char* joiner = NULL;
+        if(get_condition_joiner(params, &joiner, &responseOp, error, sizeof(error)))
+            (void)joiner;
+        else
+            responseOp = "";
     }
     json_object_set_new(data, "op", json_string(responseOp));
     json_object_set_new(data, "command", json_string(cmd));
     *out_resp = build_value_response(id, data);
+}
+
+static void handle_append_breakpoint_condition(json_t* req, json_t* params, json_t** out_resp)
+{
+    const char* id = json_string_value(json_object_get(req, "id"));
+    duint addr = 0;
+    if(!get_addr_param(params, "addr", &addr))
+    {
+        *out_resp = build_error_response(id, "append_breakpoint_condition requires addr");
+        return;
+    }
+
+    BPXTYPE requestedType = bp_none;
+    char error[256] = {0};
+    if(!get_bp_type_param(params, &requestedType, error, sizeof(error)))
+    {
+        *out_resp = build_error_response(id, error);
+        return;
+    }
+
+    char appended[MAX_CONDITIONAL_EXPR_SIZE] = {0};
+    if(!build_break_condition(params, appended, sizeof(appended), error, sizeof(error)))
+    {
+        *out_resp = build_error_response(id, error);
+        return;
+    }
+
+    char previous[MAX_CONDITIONAL_EXPR_SIZE] = {0};
+    BPXTYPE actualType = bp_none;
+    if(!read_break_condition(addr, requestedType, previous, sizeof(previous), &actualType))
+    {
+        *out_resp = build_error_response(id, "breakpoint not found at address");
+        return;
+    }
+
+    char condition[MAX_CONDITIONAL_EXPR_SIZE] = {0};
+    const char* responseOp = "and";
+    if(!combine_break_conditions(previous, appended, params, condition, sizeof(condition), &responseOp, error, sizeof(error)))
+    {
+        *out_resp = build_error_response(id, error);
+        return;
+    }
+
+    if(!write_break_condition(addr, actualType, condition, &actualType, error, sizeof(error)))
+    {
+        *out_resp = build_error_response(id, error);
+        return;
+    }
+
+    log_msg("[BP Condition] Append %s breakpoint condition on %llX -> %s",
+        bp_type_to_string(actualType), (unsigned long long)addr, condition);
+
+    json_t* data = json_object();
+    json_object_set_new(data, "ok", json_true());
+    json_object_set_new(data, "addr", addr_json(addr));
+    json_object_set_new(data, "type", json_string(bp_type_to_string(actualType)));
+    json_object_set_new(data, "condition", json_string(condition));
+    json_object_set_new(data, "previous_condition", json_string(previous));
+    json_object_set_new(data, "appended_condition", json_string(appended));
+    json_object_set_new(data, "has_condition", json_boolean(condition[0] != '\0'));
+    json_object_set_new(data, "op", json_string(responseOp ? responseOp : ""));
+    *out_resp = build_value_response(id, data);
+}
+
+static void handle_clear_breakpoint_condition(json_t* req, json_t* params, json_t** out_resp)
+{
+    const char* id = json_string_value(json_object_get(req, "id"));
+    duint addr = 0;
+    if(!get_addr_param(params, "addr", &addr))
+    {
+        *out_resp = build_error_response(id, "clear_breakpoint_condition requires addr");
+        return;
+    }
+
+    BPXTYPE requestedType = bp_none;
+    char error[256] = {0};
+    if(!get_bp_type_param(params, &requestedType, error, sizeof(error)))
+    {
+        *out_resp = build_error_response(id, error);
+        return;
+    }
+
+    char previous[MAX_CONDITIONAL_EXPR_SIZE] = {0};
+    BPXTYPE actualType = bp_none;
+    if(!read_break_condition(addr, requestedType, previous, sizeof(previous), &actualType))
+    {
+        *out_resp = build_error_response(id, "breakpoint not found at address");
+        return;
+    }
+
+    if(!write_break_condition(addr, actualType, "", &actualType, error, sizeof(error)))
+    {
+        *out_resp = build_error_response(id, error);
+        return;
+    }
+
+    log_msg("[BP Condition] Clear %s breakpoint condition on %llX",
+        bp_type_to_string(actualType), (unsigned long long)addr);
+
+    json_t* data = json_object();
+    json_object_set_new(data, "ok", json_true());
+    json_object_set_new(data, "addr", addr_json(addr));
+    json_object_set_new(data, "type", json_string(bp_type_to_string(actualType)));
+    json_object_set_new(data, "condition", json_string(""));
+    json_object_set_new(data, "previous_condition", json_string(previous));
+    json_object_set_new(data, "has_condition", json_false());
+    *out_resp = build_value_response(id, data);
+}
+
+static void handle_set_bp_filter(json_t* req, json_t* params, json_t** out_resp)
+{
+    handle_set_breakpoint_condition(req, params, out_resp);
 }
 
 static void handle_find_bytes(json_t* req, json_t* params, json_t** out_resp)
@@ -1419,6 +2064,10 @@ static const handler_entry HANDLERS[] = {
     { CMD_SET_BREAKPOINT,    handle_set_breakpoint },
     { CMD_DELETE_BREAKPOINT, handle_delete_breakpoint },
     { CMD_TOGGLE_BREAKPOINT, handle_toggle_breakpoint },
+    { CMD_GET_BREAKPOINT_CONDITION,    handle_get_breakpoint_condition },
+    { CMD_SET_BREAKPOINT_CONDITION,    handle_set_breakpoint_condition },
+    { CMD_APPEND_BREAKPOINT_CONDITION, handle_append_breakpoint_condition },
+    { CMD_CLEAR_BREAKPOINT_CONDITION,  handle_clear_breakpoint_condition },
     { CMD_GET_DEBUG_STATE,   handle_get_debug_state },
     { CMD_RUN,               handle_run },
     { CMD_PAUSE,             handle_pause },
@@ -1517,76 +2166,641 @@ static void process_request(json_t* req, char* out_buf, size_t out_buf_size)
         json_decref(emptyParams);
 }
 
-static DWORD WINAPI pipe_thread(LPVOID param)
+static void get_target_hint(char* out, size_t outSize)
+{
+    out[0] = '\0';
+    if(!DbgIsDebugging())
+        return;
+
+    duint cip = DbgValFromString("cip");
+    char module[MAX_MODULE_SIZE] = {0};
+    char path[MAX_PATH] = {0};
+    if(DbgGetModuleAt(cip, module) && module[0])
+        snprintf(out, outSize, "%s", module);
+
+    const DBGFUNCTIONS* funcs = DbgFunctions();
+    if(funcs && funcs->ModPathFromAddr && funcs->ModPathFromAddr(cip, path, MAX_PATH) && path[0])
+        snprintf(out, outSize, "%s", path);
+}
+
+static bool get_plugin_config_dir(char* out, size_t outSize)
+{
+    char modulePath[MAX_PATH] = {0};
+    if(!g_hModule || !GetModuleFileNameA(g_hModule, modulePath, MAX_PATH))
+        return false;
+
+    char* slash = strrchr(modulePath, '\\');
+    if(!slash)
+        return false;
+    *slash = '\0';
+    snprintf(out, outSize, "%s\\x64dbg-mcp", modulePath);
+    return true;
+}
+
+static bool is_absolute_path(const char* path)
+{
+    if(!path || !path[0])
+        return false;
+    if(path[0] == '\\' || path[0] == '/')
+        return true;
+    return path[1] == ':' &&
+        ((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z'));
+}
+
+static void resolve_relative_path(const char* baseDir, char* path, size_t pathSize)
+{
+    if(!path[0] || is_absolute_path(path))
+        return;
+    char resolved[MAX_PATH] = {0};
+    snprintf(resolved, sizeof(resolved), "%s\\%s", baseDir, path);
+    snprintf(path, pathSize, "%s", resolved);
+}
+
+static void load_broker_config()
+{
+    char configDir[MAX_PATH] = {0};
+    if(!get_plugin_config_dir(configDir, sizeof(configDir)))
+        return;
+
+    snprintf(g_brokerConfig.serverScript, sizeof(g_brokerConfig.serverScript), "%s\\server.py", configDir);
+    snprintf(g_brokerConfig.webRoot, sizeof(g_brokerConfig.webRoot), "%s\\web", configDir);
+
+    char configPath[MAX_PATH] = {0};
+    snprintf(configPath, sizeof(configPath), "%s\\config.json", configDir);
+    json_error_t error;
+    json_t* root = json_load_file(configPath, 0, &error);
+    if(!root)
+    {
+        log_msg("[MCP Bridge] Config not found, using defaults: %s", configPath);
+        return;
+    }
+
+    const char* brokerUrl = json_string_value(json_object_get(root, "broker_url"));
+    const char* pythonPath = json_string_value(json_object_get(root, "python_path"));
+    const char* serverScript = json_string_value(json_object_get(root, "server_script"));
+    const char* webRoot = json_string_value(json_object_get(root, "web_root"));
+    json_t* interval = json_object_get(root, "watchdog_interval_ms");
+    json_t* failures = json_object_get(root, "watchdog_failures_before_notify");
+    json_t* autoRestart = json_object_get(root, "auto_restart_broker");
+
+    if(brokerUrl && brokerUrl[0])
+        snprintf(g_brokerConfig.brokerUrl, sizeof(g_brokerConfig.brokerUrl), "%s", brokerUrl);
+    if(pythonPath && pythonPath[0])
+        snprintf(g_brokerConfig.pythonPath, sizeof(g_brokerConfig.pythonPath), "%s", pythonPath);
+    if(serverScript && serverScript[0])
+        snprintf(g_brokerConfig.serverScript, sizeof(g_brokerConfig.serverScript), "%s", serverScript);
+    if(webRoot && webRoot[0])
+        snprintf(g_brokerConfig.webRoot, sizeof(g_brokerConfig.webRoot), "%s", webRoot);
+    if(json_is_integer(interval))
+        g_brokerConfig.watchdogIntervalMs = (DWORD)json_integer_value(interval);
+    if(json_is_integer(failures))
+        g_brokerConfig.failuresBeforeNotify = (int)json_integer_value(failures);
+    if(json_is_boolean(autoRestart))
+        g_brokerConfig.autoRestartBroker = json_is_true(autoRestart);
+
+    json_decref(root);
+    resolve_relative_path(configDir, g_brokerConfig.serverScript, sizeof(g_brokerConfig.serverScript));
+    resolve_relative_path(configDir, g_brokerConfig.webRoot, sizeof(g_brokerConfig.webRoot));
+    log_msg("[MCP Bridge] Broker config loaded: %s", configPath);
+}
+
+static bool parse_http_url(const char* url, char* host, size_t hostSize, unsigned short* port, char* path, size_t pathSize)
+{
+    const char* p = strstr(url, "://");
+    p = p ? p + 3 : url;
+    const char* slash = strchr(p, '/');
+    const char* hostEnd = slash ? slash : p + strlen(p);
+    const char* colon = NULL;
+    for(const char* it = p; it < hostEnd; it++)
+    {
+        if(*it == ':')
+        {
+            colon = it;
+            break;
+        }
+    }
+
+    size_t hostLen = (size_t)((colon ? colon : hostEnd) - p);
+    if(hostLen == 0 || hostLen >= hostSize)
+        return false;
+    memcpy(host, p, hostLen);
+    host[hostLen] = '\0';
+
+    *port = colon ? (unsigned short)atoi(colon + 1) : 80;
+    snprintf(path, pathSize, "%s", slash ? slash : "/");
+    return true;
+}
+
+static bool broker_request(const char* method, const char* pathSuffix, const char* body, char* response, size_t responseSize)
+{
+    char host[128] = {0};
+    char basePath[256] = {0};
+    unsigned short port = 0;
+    if(!parse_http_url(g_brokerConfig.brokerUrl, host, sizeof(host), &port, basePath, sizeof(basePath)))
+        return false;
+
+    char path[512] = {0};
+    if(strcmp(basePath, "/") == 0)
+        snprintf(path, sizeof(path), "%s", pathSuffix);
+    else
+        snprintf(path, sizeof(path), "%s%s", basePath, pathSuffix);
+
+    WSADATA wsa = {0};
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+
+    SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if(sock == INVALID_SOCKET)
+    {
+        WSACleanup();
+        return false;
+    }
+
+    sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = inet_addr(host);
+    if(addr.sin_addr.s_addr == INADDR_NONE || connect(sock, (sockaddr*)&addr, sizeof(addr)) != 0)
+    {
+        closesocket(sock);
+        WSACleanup();
+        return false;
+    }
+
+    const char* payload = body ? body : "";
+    char header[1024];
+    int headerLen = snprintf(header, sizeof(header),
+        "%s %s HTTP/1.1\r\n"
+        "Host: %s:%u\r\n"
+        "Accept: application/json\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %u\r\n"
+        "Connection: close\r\n"
+        "\r\n",
+        method, path, host, (unsigned int)port, (unsigned int)strlen(payload));
+    bool ok = headerLen > 0 && send_all(sock, header, headerLen) && (!payload[0] || send_all(sock, payload, (int)strlen(payload)));
+    int total = 0;
+    if(ok && response && responseSize > 0)
+    {
+        while(total < (int)responseSize - 1)
+        {
+            int received = recv(sock, response + total, (int)responseSize - 1 - total, 0);
+            if(received <= 0)
+                break;
+            total += received;
+        }
+        response[total] = '\0';
+    }
+    else if(ok)
+    {
+        char discard[512];
+        while(recv(sock, discard, sizeof(discard), 0) > 0) {}
+    }
+
+    closesocket(sock);
+    WSACleanup();
+
+    if(!ok || !response || responseSize == 0)
+        return ok;
+    return strstr(response, "HTTP/1.1 200") != NULL || strstr(response, "HTTP/1.0 200") != NULL;
+}
+
+static bool broker_health_ok()
+{
+    char response[1024] = {0};
+    return broker_request("GET", "/api/health", "", response, sizeof(response));
+}
+
+static bool start_broker_process()
+{
+    if(g_brokerConfig.serverScript[0] == '\0')
+    {
+        log_msg("[MCP Bridge] Broker server_script is not configured");
+        return false;
+    }
+    if(broker_health_ok())
+        return true;
+
+    char host[128] = {0};
+    char basePath[256] = {0};
+    unsigned short port = 0;
+    parse_http_url(g_brokerConfig.brokerUrl, host, sizeof(host), &port, basePath, sizeof(basePath));
+
+    char cmd[2048];
+    snprintf(cmd, sizeof(cmd), "\"%s\" \"%s\" --broker --host %s --port %u --web-root \"%s\"",
+        g_brokerConfig.pythonPath,
+        g_brokerConfig.serverScript,
+        host[0] ? host : "127.0.0.1",
+        (unsigned int)(port ? port : 21463),
+        g_brokerConfig.webRoot);
+
+    STARTUPINFOA si = {0};
+    PROCESS_INFORMATION pi = {0};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    BOOL created = CreateProcessA(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+    if(!created)
+    {
+        log_msg("[MCP Bridge] Failed to start broker: %s", cmd);
+        return false;
+    }
+
+    if(g_hBrokerProcess)
+        CloseHandle(g_hBrokerProcess);
+    g_hBrokerProcess = pi.hProcess;
+    CloseHandle(pi.hThread);
+    log_msg("[MCP Bridge] Started broker: %s", cmd);
+
+    for(int i = 0; i < 20; i++)
+    {
+        if(broker_health_ok())
+            return true;
+        Sleep(250);
+    }
+    return false;
+}
+
+static void notify_broker_down_once()
+{
+    static volatile LONG shown = 0;
+    if(InterlockedCompareExchange(&shown, 1, 0) == 0)
+    {
+        MessageBoxA(NULL,
+            "x64dbg MCP broker is not responding. Check x64dbg\\plugins\\x64dbg-mcp\\config.json and Python.",
+            "x64dbg MCP",
+            MB_ICONWARNING | MB_OK);
+    }
+}
+
+static void register_or_unregister_session()
+{
+    bool debugging = DbgIsDebugging();
+    if(debugging && g_httpPort != 0)
+    {
+        char targetHint[MAX_PATH] = {0};
+        char controlUrl[128] = {0};
+        char pluginId[64] = {0};
+        get_target_hint(targetHint, sizeof(targetHint));
+        snprintf(controlUrl, sizeof(controlUrl), "http://%s:%u", HTTP_HOST, (unsigned int)g_httpPort);
+        snprintf(pluginId, sizeof(pluginId), "%lu:%u", GetCurrentProcessId(), (unsigned int)g_httpPort);
+
+        json_t* root = json_object();
+        json_object_set_new(root, "plugin_id", json_string(pluginId));
+        json_object_set_new(root, "pid", json_integer(GetCurrentProcessId()));
+        json_object_set_new(root, "state", json_string(get_debug_state_string()));
+        json_object_set_new(root, "control_port", json_integer(g_httpPort));
+        json_object_set_new(root, "control_url", json_string(controlUrl));
+        json_object_set_new(root, "target_hint", json_string(targetHint));
+        char* body = json_dumps(root, JSON_COMPACT);
+        json_decref(root);
+        if(body)
+        {
+            if(broker_request("POST", "/api/register_session", body, NULL, 0))
+                InterlockedExchange(&g_sessionRegistered, 1);
+            free(body);
+        }
+    }
+    else if(InterlockedCompareExchange(&g_sessionRegistered, 0, 0))
+    {
+        char pluginId[64] = {0};
+        snprintf(pluginId, sizeof(pluginId), "%lu:%u", GetCurrentProcessId(), (unsigned int)g_httpPort);
+        json_t* root = json_object();
+        json_object_set_new(root, "plugin_id", json_string(pluginId));
+        char* body = json_dumps(root, JSON_COMPACT);
+        json_decref(root);
+        if(body)
+        {
+            if(broker_request("POST", "/api/unregister_session", body, NULL, 0))
+                InterlockedExchange(&g_sessionRegistered, 0);
+            free(body);
+        }
+    }
+}
+
+static DWORD WINAPI watchdog_thread(LPVOID param)
 {
     (void)param;
+    int failures = 0;
+    start_broker_process();
 
     while(InterlockedCompareExchange(&g_running, 0, 0))
     {
-        HANDLE hPipe = CreateNamedPipeW(
-            PIPE_NAME,
-            PIPE_ACCESS_DUPLEX,
-            PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
-            1,
-            PIPE_BUFFER_SIZE,
-            PIPE_BUFFER_SIZE,
-            0,
-            NULL);
-
-        if(hPipe == INVALID_HANDLE_VALUE)
+        if(broker_health_ok())
         {
-            Sleep(1000);
-            continue;
+            failures = 0;
+            register_or_unregister_session();
         }
-
-        BOOL connected = ConnectNamedPipe(hPipe, NULL) ?
-            TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
-
-        if(connected)
+        else
         {
-            log_msg("[MCP Bridge] Client connected");
-            char* buf = (char*)BridgeAlloc(PIPE_BUFFER_SIZE);
-            char* out_buf = (char*)BridgeAlloc(PIPE_BUFFER_SIZE);
-
-            while(InterlockedCompareExchange(&g_running, 0, 0))
-            {
-                DWORD bytesRead = 0;
-                BOOL ok = ReadFile(hPipe, buf, PIPE_BUFFER_SIZE - 1, &bytesRead, NULL);
-                if(!ok || bytesRead == 0)
-                    break;
-
-                buf[bytesRead] = '\0';
-
-                json_error_t error;
-                json_t* req = json_loads(buf, 0, &error);
-                if(req)
-                {
-                    process_request(req, out_buf, PIPE_BUFFER_SIZE);
-                    json_decref(req);
-
-                    if(out_buf[0])
-                    {
-                        DWORD written = 0;
-                        WriteFile(hPipe, out_buf, (DWORD)strlen(out_buf), &written, NULL);
-                    }
-                }
-                else
-                {
-                    const char* err = "{\"error\":\"invalid json\"}\n";
-                    DWORD written = 0;
-                    WriteFile(hPipe, err, (DWORD)strlen(err), &written, NULL);
-                }
-            }
-
-            BridgeFree(buf);
-            BridgeFree(out_buf);
-            log_msg("[MCP Bridge] Client disconnected");
+            failures++;
+            if(g_brokerConfig.autoRestartBroker)
+                start_broker_process();
+            if(failures >= g_brokerConfig.failuresBeforeNotify)
+                notify_broker_down_once();
         }
+        Sleep(g_brokerConfig.watchdogIntervalMs);
+    }
+    return 0;
+}
 
-        DisconnectNamedPipe(hPipe);
-        CloseHandle(hPipe);
+static json_t* build_instance_info_json()
+{
+    char url[128];
+    char targetHint[MAX_PATH] = {0};
+    snprintf(url, sizeof(url), "http://%s:%u", HTTP_HOST, (unsigned int)g_httpPort);
+    get_target_hint(targetHint, sizeof(targetHint));
+
+    json_t* info = json_object();
+    json_object_set_new(info, "ok", json_true());
+    json_object_set_new(info, "transport", json_string("http"));
+    json_object_set_new(info, "host", json_string(HTTP_HOST));
+    json_object_set_new(info, "port", json_integer(g_httpPort));
+    json_object_set_new(info, "url", json_string(url));
+    json_object_set_new(info, "pid", json_integer(GetCurrentProcessId()));
+    json_object_set_new(info, "state", json_string(get_debug_state_string()));
+    json_object_set_new(info, "target_hint", json_string(targetHint));
+    return info;
+}
+
+static void delete_instance_file()
+{
+    if(g_instanceFile[0])
+    {
+        DeleteFileA(g_instanceFile);
+        g_instanceFile[0] = '\0';
+    }
+}
+
+static bool write_instance_file()
+{
+    char tempPath[MAX_PATH] = {0};
+    DWORD tempLen = GetTempPathA(MAX_PATH, tempPath);
+    if(tempLen == 0 || tempLen >= MAX_PATH)
+        return false;
+
+    char rootDir[MAX_PATH] = {0};
+    char instanceDir[MAX_PATH] = {0};
+    snprintf(rootDir, sizeof(rootDir), "%s%s", tempPath, HTTP_INSTANCE_ROOT);
+    CreateDirectoryA(rootDir, NULL);
+    snprintf(instanceDir, sizeof(instanceDir), "%s\\%s", rootDir, HTTP_INSTANCE_DIR);
+    CreateDirectoryA(instanceDir, NULL);
+    snprintf(g_instanceFile, sizeof(g_instanceFile), "%s\\%lu.json", instanceDir, GetCurrentProcessId());
+
+    json_t* info = build_instance_info_json();
+    char* text = json_dumps(info, JSON_INDENT(2));
+    json_decref(info);
+    if(!text)
+        return false;
+
+    HANDLE file = CreateFileA(g_instanceFile, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if(file == INVALID_HANDLE_VALUE)
+    {
+        free(text);
+        return false;
     }
 
+    DWORD written = 0;
+    BOOL ok = WriteFile(file, text, (DWORD)strlen(text), &written, NULL);
+    CloseHandle(file);
+    free(text);
+    return ok == TRUE;
+}
+
+static bool send_all(SOCKET sock, const char* data, int len)
+{
+    int sentTotal = 0;
+    while(sentTotal < len)
+    {
+        int sent = send(sock, data + sentTotal, len - sentTotal, 0);
+        if(sent == SOCKET_ERROR || sent == 0)
+            return false;
+        sentTotal += sent;
+    }
+    return true;
+}
+
+static void send_http_response(SOCKET client, int status, const char* reason, const char* contentType, const char* body)
+{
+    if(!body)
+        body = "";
+    char header[512];
+    int bodyLen = (int)strlen(body);
+    int headerLen = snprintf(header, sizeof(header),
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Type: %s\r\n"
+        "Content-Length: %d\r\n"
+        "Connection: close\r\n"
+        "\r\n",
+        status, reason, contentType ? contentType : "application/json", bodyLen);
+    if(headerLen > 0)
+        send_all(client, header, headerLen);
+    if(bodyLen > 0)
+        send_all(client, body, bodyLen);
+}
+
+static int get_http_content_length(const char* headers)
+{
+    const char* p = headers;
+    while(p && *p)
+    {
+        const char* lineEnd = strstr(p, "\r\n");
+        size_t lineLen = lineEnd ? (size_t)(lineEnd - p) : strlen(p);
+        if(lineLen >= 15 && _strnicmp(p, "Content-Length:", 15) == 0)
+            return atoi(p + 15);
+        if(!lineEnd)
+            break;
+        p = lineEnd + 2;
+    }
+    return 0;
+}
+
+static void send_instance_info(SOCKET client)
+{
+    write_instance_file();
+    json_t* info = build_instance_info_json();
+    char* body = json_dumps(info, JSON_COMPACT);
+    json_decref(info);
+    if(body)
+    {
+        send_http_response(client, 200, "OK", "application/json", body);
+        free(body);
+    }
+    else
+    {
+        send_http_response(client, 500, "Internal Server Error", "application/json", "{\"error\":\"failed to build info\"}");
+    }
+}
+
+static void handle_http_client(SOCKET client)
+{
+    char* buf = (char*)BridgeAlloc(HTTP_BUFFER_SIZE);
+    char* out_buf = (char*)BridgeAlloc(HTTP_BUFFER_SIZE);
+    if(!buf || !out_buf)
+    {
+        if(buf) BridgeFree(buf);
+        if(out_buf) BridgeFree(out_buf);
+        send_http_response(client, 500, "Internal Server Error", "application/json", "{\"error\":\"allocation failed\"}");
+        return;
+    }
+
+    int total = 0;
+    int headerLen = 0;
+    int contentLength = 0;
+    while(total < HTTP_BUFFER_SIZE - 1)
+    {
+        int received = recv(client, buf + total, HTTP_BUFFER_SIZE - 1 - total, 0);
+        if(received <= 0)
+            break;
+        total += received;
+        buf[total] = '\0';
+
+        char* headerEnd = strstr(buf, "\r\n\r\n");
+        if(headerEnd)
+        {
+            headerLen = (int)(headerEnd - buf) + 4;
+            contentLength = get_http_content_length(buf);
+            if(contentLength < 0 || contentLength > HTTP_BUFFER_SIZE - headerLen - 1)
+            {
+                send_http_response(client, 413, "Payload Too Large", "application/json", "{\"error\":\"request body too large\"}");
+                BridgeFree(buf);
+                BridgeFree(out_buf);
+                return;
+            }
+            if(contentLength == 0 || total >= headerLen + contentLength)
+                break;
+        }
+    }
+
+    char method[16] = {0};
+    char path[256] = {0};
+    if(sscanf(buf, "%15s %255s", method, path) != 2)
+    {
+        send_http_response(client, 400, "Bad Request", "application/json", "{\"error\":\"bad request\"}");
+        BridgeFree(buf);
+        BridgeFree(out_buf);
+        return;
+    }
+
+    if(_stricmp(method, "GET") == 0 && (strcmp(path, "/health") == 0 || strcmp(path, "/info") == 0))
+    {
+        send_instance_info(client);
+    }
+    else if(_stricmp(method, "POST") == 0 && strcmp(path, "/rpc") == 0)
+    {
+        char* body = headerLen > 0 ? buf + headerLen : NULL;
+        if(!body || contentLength <= 0)
+        {
+            send_http_response(client, 400, "Bad Request", "application/json", "{\"error\":\"missing json body\"}");
+        }
+        else
+        {
+            body[contentLength] = '\0';
+            json_error_t error;
+            json_t* req = json_loads(body, 0, &error);
+            if(req)
+            {
+                process_request(req, out_buf, HTTP_BUFFER_SIZE);
+                json_decref(req);
+                send_http_response(client, 200, "OK", "application/json", out_buf[0] ? out_buf : "{}");
+            }
+            else
+            {
+                send_http_response(client, 400, "Bad Request", "application/json", "{\"error\":\"invalid json\"}");
+            }
+        }
+    }
+    else
+    {
+        send_http_response(client, 404, "Not Found", "application/json", "{\"error\":\"not found\"}");
+    }
+
+    BridgeFree(buf);
+    BridgeFree(out_buf);
+}
+
+static DWORD WINAPI http_client_thread(LPVOID param)
+{
+    SOCKET client = (SOCKET)(UINT_PTR)param;
+    handle_http_client(client);
+    shutdown(client, SD_BOTH);
+    closesocket(client);
+    return 0;
+}
+
+static bool bind_http_socket(SOCKET listenSocket, unsigned short* outPort)
+{
+    sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    for(unsigned short port = HTTP_PORT_START; port <= HTTP_PORT_END; port++)
+    {
+        addr.sin_port = htons(port);
+        if(bind(listenSocket, (sockaddr*)&addr, sizeof(addr)) == 0)
+        {
+            *outPort = port;
+            return true;
+        }
+    }
+    return false;
+}
+
+static DWORD WINAPI http_thread(LPVOID param)
+{
+    (void)param;
+
+    WSADATA wsa = {0};
+    if(WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
+    {
+        log_msg("[MCP Bridge] WSAStartup failed");
+        return 0;
+    }
+
+    SOCKET listenSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if(listenSocket == INVALID_SOCKET)
+    {
+        log_msg("[MCP Bridge] Failed to create HTTP socket");
+        WSACleanup();
+        return 0;
+    }
+
+    unsigned short port = 0;
+    if(!bind_http_socket(listenSocket, &port) || listen(listenSocket, SOMAXCONN) != 0)
+    {
+        log_msg("[MCP Bridge] Failed to bind HTTP server on %s:%u-%u", HTTP_HOST, HTTP_PORT_START, HTTP_PORT_END);
+        closesocket(listenSocket);
+        WSACleanup();
+        return 0;
+    }
+
+    g_listenSocket = listenSocket;
+    g_httpPort = port;
+    write_instance_file();
+    log_msg("[MCP Bridge] HTTP server listening on http://%s:%u", HTTP_HOST, (unsigned int)g_httpPort);
+
+    while(InterlockedCompareExchange(&g_running, 0, 0))
+    {
+        SOCKET client = accept(listenSocket, NULL, NULL);
+        if(client == INVALID_SOCKET)
+        {
+            if(InterlockedCompareExchange(&g_running, 0, 0))
+                Sleep(50);
+            continue;
+        }
+        HANDLE thread = CreateThread(NULL, 0, http_client_thread, (LPVOID)(UINT_PTR)client, 0, NULL);
+        if(thread)
+            CloseHandle(thread);
+        else
+        {
+            shutdown(client, SD_BOTH);
+            closesocket(client);
+        }
+    }
+
+    delete_instance_file();
+    g_listenSocket = INVALID_SOCKET;
+    closesocket(listenSocket);
+    WSACleanup();
     return 0;
 }
 
@@ -1602,12 +2816,30 @@ extern "C" __declspec(dllexport) bool pluginit(PLUG_INITSTRUCT* initStruct)
 extern "C" __declspec(dllexport) bool plugstop()
 {
     InterlockedExchange(&g_running, 0);
-    if(g_hPipeThread)
+    if(g_listenSocket != INVALID_SOCKET)
     {
-        WaitForSingleObject(g_hPipeThread, 3000);
-        CloseHandle(g_hPipeThread);
-        g_hPipeThread = NULL;
+        shutdown(g_listenSocket, SD_BOTH);
+        closesocket(g_listenSocket);
+        g_listenSocket = INVALID_SOCKET;
     }
+    if(g_hHttpThread)
+    {
+        WaitForSingleObject(g_hHttpThread, 3000);
+        CloseHandle(g_hHttpThread);
+        g_hHttpThread = NULL;
+    }
+    if(g_hWatchdogThread)
+    {
+        WaitForSingleObject(g_hWatchdogThread, 3000);
+        CloseHandle(g_hWatchdogThread);
+        g_hWatchdogThread = NULL;
+    }
+    if(g_hBrokerProcess)
+    {
+        CloseHandle(g_hBrokerProcess);
+        g_hBrokerProcess = NULL;
+    }
+    delete_instance_file();
     return true;
 }
 
@@ -1615,18 +2847,22 @@ extern "C" __declspec(dllexport) void plugsetup(PLUG_SETUPSTRUCT* setupStruct)
 {
     (void)setupStruct;
     init_console();
+    load_broker_config();
     InterlockedExchange(&g_running, 1);
-    g_hPipeThread = CreateThread(NULL, 0, pipe_thread, NULL, 0, NULL);
+    g_hHttpThread = CreateThread(NULL, 0, http_thread, NULL, 0, NULL);
+    g_hWatchdogThread = CreateThread(NULL, 0, watchdog_thread, NULL, 0, NULL);
     log_msg("[MCP Bridge] Plugin loaded successfully");
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved)
 {
-    (void)hModule;
     (void)lpReserved;
+    if(ul_reason_for_call == DLL_PROCESS_ATTACH)
+        g_hModule = hModule;
     if(ul_reason_for_call == DLL_PROCESS_DETACH)
     {
         InterlockedExchange(&g_running, 0);
+        delete_instance_file();
     }
     return TRUE;
 }
