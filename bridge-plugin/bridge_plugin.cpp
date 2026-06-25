@@ -10,6 +10,10 @@
 #include "../pluginsdk/bridgemain.h"
 #include "../pluginsdk/_plugins.h"
 #include "../pluginsdk/_dbgfunctions.h"
+#include "../pluginsdk/_scriptapi_label.h"
+#include "../pluginsdk/_scriptapi_comment.h"
+#include "../pluginsdk/_scriptapi_module.h"
+#include "../pluginsdk/_scriptapi_symbol.h"
 #include "../pluginsdk/jansson/jansson.h"
 #include "protocol.h"
 
@@ -2028,6 +2032,182 @@ static void handle_find_string(json_t* req, json_t* params, json_t** out_resp)
     *out_resp = build_value_response(id, data);
 }
 
+static void handle_enum_labels(json_t* req, json_t* params, json_t** out_resp)
+{
+    (void)params;
+    const char* id = json_string_value(json_object_get(req, "id"));
+
+    BridgeList<Script::Label::LabelInfo> list;
+    if(!Script::Label::GetList(&list))
+    {
+        *out_resp = build_error_response(id, "Failed to enumerate labels");
+        return;
+    }
+
+    json_t* labels = json_array();
+    for(int i = 0; i < list.Count(); i++)
+    {
+        json_t* s = json_object();
+        json_object_set_new(s, "module", json_string(list[i].mod));
+        json_object_set_new(s, "rva", addr_json(list[i].rva));
+        json_object_set_new(s, "text", json_string(list[i].text));
+        json_object_set_new(s, "manual", json_boolean(list[i].manual));
+        json_array_append_new(labels, s);
+    }
+
+    json_t* data = json_object();
+    json_object_set_new(data, "count", json_integer(list.Count()));
+    json_object_set_new(data, "labels", labels);
+    *out_resp = build_value_response(id, data);
+}
+
+static void handle_enum_comments(json_t* req, json_t* params, json_t** out_resp)
+{
+    (void)params;
+    const char* id = json_string_value(json_object_get(req, "id"));
+
+    BridgeList<Script::Comment::CommentInfo> list;
+    if(!Script::Comment::GetList(&list))
+    {
+        *out_resp = build_error_response(id, "Failed to enumerate comments");
+        return;
+    }
+
+    json_t* comments = json_array();
+    for(int i = 0; i < list.Count(); i++)
+    {
+        json_t* s = json_object();
+        json_object_set_new(s, "module", json_string(list[i].mod));
+        json_object_set_new(s, "rva", addr_json(list[i].rva));
+        json_object_set_new(s, "text", json_string(list[i].text));
+        json_object_set_new(s, "manual", json_boolean(list[i].manual));
+        json_array_append_new(comments, s);
+    }
+
+    json_t* data = json_object();
+    json_object_set_new(data, "count", json_integer(list.Count()));
+    json_object_set_new(data, "comments", comments);
+    *out_resp = build_value_response(id, data);
+}
+
+static void handle_enum_imports(json_t* req, json_t* params, json_t** out_resp)
+{
+    const char* id = json_string_value(json_object_get(req, "id"));
+    duint base = 0;
+    const char* modname = NULL;
+
+    if(json_is_string(json_object_get(params, "addr")))
+        get_addr_param(params, "addr", &base);
+    else if(json_is_string(json_object_get(params, "name")))
+        modname = json_string_value(json_object_get(params, "name"));
+    else
+    {
+        *out_resp = build_error_response(id, "enum_imports requires addr (hex string) or name (string)");
+        return;
+    }
+
+    if(!base && modname)
+        base = DbgModBaseFromName(modname);
+    if(!base)
+    {
+        *out_resp = build_error_response(id, "Module not found");
+        return;
+    }
+
+    Script::Module::ModuleInfo modInfo = {0};
+    if(!Script::Module::InfoFromAddr(base, &modInfo))
+    {
+        *out_resp = build_error_response(id, "Module info not available");
+        return;
+    }
+
+    BridgeList<Script::Module::ModuleImport> list;
+    if(!Script::Module::GetImports(&modInfo, &list))
+    {
+        *out_resp = build_error_response(id, "Failed to enumerate imports");
+        return;
+    }
+
+    json_t* imports = json_array();
+    for(int i = 0; i < list.Count(); i++)
+    {
+        json_t* s = json_object();
+        json_object_set_new(s, "iat_rva", addr_json(list[i].iatRva));
+        json_object_set_new(s, "iat_va", addr_json(list[i].iatVa));
+        json_object_set_new(s, "ordinal", addr_json(list[i].ordinal));
+        json_object_set_new(s, "name", json_string(list[i].name));
+        json_object_set_new(s, "undecorated_name", json_string(list[i].undecoratedName));
+        json_array_append_new(imports, s);
+    }
+
+    json_t* data = json_object();
+    json_object_set_new(data, "module", json_string(modInfo.name));
+    json_object_set_new(data, "module_base", addr_json(modInfo.base));
+    json_object_set_new(data, "count", json_integer(list.Count()));
+    json_object_set_new(data, "imports", imports);
+    *out_resp = build_value_response(id, data);
+}
+
+static void handle_enum_exports(json_t* req, json_t* params, json_t** out_resp)
+{
+    const char* id = json_string_value(json_object_get(req, "id"));
+    duint base = 0;
+    const char* modname = NULL;
+
+    if(json_is_string(json_object_get(params, "addr")))
+        get_addr_param(params, "addr", &base);
+    else if(json_is_string(json_object_get(params, "name")))
+        modname = json_string_value(json_object_get(params, "name"));
+    else
+    {
+        *out_resp = build_error_response(id, "enum_exports requires addr (hex string) or name (string)");
+        return;
+    }
+
+    if(!base && modname)
+        base = DbgModBaseFromName(modname);
+    if(!base)
+    {
+        *out_resp = build_error_response(id, "Module not found");
+        return;
+    }
+
+    Script::Module::ModuleInfo modInfo = {0};
+    if(!Script::Module::InfoFromAddr(base, &modInfo))
+    {
+        *out_resp = build_error_response(id, "Module info not available");
+        return;
+    }
+
+    BridgeList<Script::Module::ModuleExport> list;
+    if(!Script::Module::GetExports(&modInfo, &list))
+    {
+        *out_resp = build_error_response(id, "Failed to enumerate exports");
+        return;
+    }
+
+    json_t* exports = json_array();
+    for(int i = 0; i < list.Count(); i++)
+    {
+        json_t* s = json_object();
+        json_object_set_new(s, "ordinal", addr_json(list[i].ordinal));
+        json_object_set_new(s, "rva", addr_json(list[i].rva));
+        json_object_set_new(s, "va", addr_json(list[i].va));
+        json_object_set_new(s, "forwarded", json_boolean(list[i].forwarded));
+        json_object_set_new(s, "forward_name", json_string(list[i].forwardName));
+        json_object_set_new(s, "name", json_string(list[i].name));
+        json_object_set_new(s, "undecorated_name", json_string(list[i].undecoratedName));
+        json_array_append_new(exports, s);
+    }
+
+    json_t* data = json_object();
+    json_object_set_new(data, "module", json_string(modInfo.name));
+    json_object_set_new(data, "module_base", addr_json(modInfo.base));
+    json_object_set_new(data, "count", json_integer(list.Count()));
+    json_object_set_new(data, "exports", exports);
+    *out_resp = build_value_response(id, data);
+}
+
 static void handle_cmd_exec(json_t* req, json_t* params, json_t** out_resp)
 {
     const char* id = json_string_value(json_object_get(req, "id"));
@@ -2096,6 +2276,10 @@ static const handler_entry HANDLERS[] = {
     { CMD_GET_XREFS,         handle_get_xrefs },
     { CMD_SET_BP_FILTER,     handle_set_bp_filter },
     { CMD_CMD_EXEC,          handle_cmd_exec },
+    { CMD_ENUM_LABELS,       handle_enum_labels },
+    { CMD_ENUM_COMMENTS,     handle_enum_comments },
+    { CMD_ENUM_IMPORTS,      handle_enum_imports },
+    { CMD_ENUM_EXPORTS,      handle_enum_exports },
 };
 
 static cmd_handler get_handler(const char* method)

@@ -54,6 +54,10 @@ TOOL_TO_CMD: dict[str, str] = {
     "string_read": "get_string",
     "find_string": "find_string",
     "cmd_exec": "cmd_exec",
+    "labels_list": "enum_labels",
+    "comments_list": "enum_comments",
+    "imports_list": "enum_imports",
+    "exports_list": "enum_exports",
 }
 
 TOOL_DEFINITIONS: tuple[dict[str, Any], ...] = (
@@ -256,6 +260,38 @@ TOOL_DEFINITIONS: tuple[dict[str, Any], ...] = (
                 "op": {"type": "string", "enum": ["and", "or"], "default": "and", "description": "How to combine conditions when conditions is provided."},
             },
             "required": ["addr"],
+        },
+    },
+    {
+        "name": "labels_list",
+        "description": "List all user-defined labels in the debugged process. Returns module, RVA, text, and whether each label is manually created.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "comments_list",
+        "description": "List all user-defined comments in the debugged process. Returns module, RVA, text, and whether each comment is manually created.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "imports_list",
+        "description": "List all imports of a module. Provide addr (hex) or name (string) to identify the module.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "addr": ADDRESS,
+                "name": {"type": "string", "description": "Module name (e.g. 'kernel32.dll')."},
+            },
+        },
+    },
+    {
+        "name": "exports_list",
+        "description": "List all exports of a module. Provide addr (hex) or name (string) to identify the module.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "addr": ADDRESS,
+                "name": {"type": "string", "description": "Module name (e.g. 'kernel32.dll')."},
+            },
         },
     },
     {"name": "cmd_exec", "description": "Execute an x64dbg console command directly.", "inputSchema": {"type": "object", "properties": {"command": {"type": "string", "description": "x64dbg command ('alloc 0x1000', 'msg Hello')."}}, "required": ["command"]}},

@@ -1,6 +1,6 @@
 # x64dbg-mcp
 
-x64dbg 的 MCP 服务端——让 AI 助手（Claude、Cursor、VS Code 等）直接控制 Windows 调试器。
+x64dbg 的 MCP Server——通过 MCP 协议让任意 AI Agent 远程控制 x64dbg 调试器。
 
 ## 架构
 
@@ -131,9 +131,9 @@ mcp-server\
 
 1. 先启动 x64dbg，插件会用相对路径启动 `x64dbg-mcp\server.py --broker`
 2. Broker 监听 `http://127.0.0.1:21463`
-3. 再启动 Codex 等 Agent 工具，通过 HTTP 连接 broker
+3. 再启动 Agent 工具（如 Claude、Cursor、VS Code 等），通过 HTTP 连接 broker
 
-Codex 全局 MCP 配置使用 URL，不再让 Codex 启动 Python server：
+MCP 客户端配置使用 URL，不再让 Agent 工具启动 Python server：
 
 ```json
 {
@@ -197,7 +197,7 @@ POST http://127.0.0.1:21463/A/rpc
 }
 ```
 
-## 工具列表 (41)
+## 工具列表 (45)
 
 ### 内存操作
 | 工具 | 说明 |
@@ -249,7 +249,9 @@ POST http://127.0.0.1:21463/A/rpc
 |------|------|
 | `modules_get` | 列出已加载模块及基址 |
 | `module_info` | 获取模块名称、路径、大小 |
-| `symbols_get` | 枚举模块的导出/导入符号 |
+| `symbols_get` | 枚举模块的 PDB 调试符号、导入/导出 |
+| `imports_list` | 列出指定模块的所有导入函数 (IAT) |
+| `exports_list` | 列出指定模块的所有导出函数 (EAT) |
 
 ### 栈与线程
 | 工具 | 说明 |
@@ -269,8 +271,10 @@ POST http://127.0.0.1:21463/A/rpc
 |------|------|
 | `evaluate` | 求值 x64dbg 表达式 |
 | `string_read` | 读取地址处的字符串（自动检测 UTF-16LE/ASCII/UTF-8） |
-| `label_get` / `label_set` | 获取/设置标签 |
-| `comment_get` / `comment_set` | 获取/设置注释 |
+| `label_get` / `label_set` | 获取/设置单个标签 |
+| `labels_list` | 列出所有用户自定义标签 |
+| `comment_get` / `comment_set` | 获取/设置单个注释 |
+| `comments_list` | 列出所有用户自定义注释 |
 | `get_function_info` | 获取函数边界（起始/结束地址） |
 | `cmd_exec` | 直接执行 x64dbg 控制台命令 |
 

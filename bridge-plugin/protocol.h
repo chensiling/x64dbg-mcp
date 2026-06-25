@@ -52,5 +52,9 @@
 #define CMD_GET_XREFS           "get_xrefs"
 #define CMD_SET_BP_FILTER       "set_bp_filter"
 #define CMD_CMD_EXEC          "cmd_exec"
+#define CMD_ENUM_LABELS        "enum_labels"
+#define CMD_ENUM_COMMENTS      "enum_comments"
+#define CMD_ENUM_IMPORTS       "enum_imports"
+#define CMD_ENUM_EXPORTS       "enum_exports"
 
 #endif // MCP_PROTOCOL_H
