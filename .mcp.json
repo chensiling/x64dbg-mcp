@@ -1,9 +1,8 @@
 {
   "mcpServers": {
     "x64dbg": {
-      "command": "python",
-      "args": ["mcp-server/server.py"],
-      "cwd": "${workspaceFolder}"
+      "url": "http://127.0.0.1:21463",
+      "enabled": true
     }
   }
 }
