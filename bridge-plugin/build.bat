@@ -23,6 +23,11 @@ cl.exe /nologo /O2 /MD /LD /EHsc ^
     /DBUILD_BRIDGE /D_CRT_SECURE_NO_WARNINGS /D_WIN64 ^
     /Fe:"%OUT_DIR%\%PLUGIN_NAME%.dp64" ^
     "%SCRIPT_DIR%bridge_plugin.cpp" ^
+    "%SCRIPT_DIR%util.cpp" ^
+    "%SCRIPT_DIR%commands.cpp" ^
+    "%SCRIPT_DIR%http_server.cpp" ^
+    "%SCRIPT_DIR%broker.cpp" ^
+    "%SCRIPT_DIR%instance_file.cpp" ^
     "%PLUGINSDK%\x64dbg.lib" ^
     "%PLUGINSDK%\x64bridge.lib" ^
     "%PLUGINSDK%\jansson\jansson_x64.lib" ^

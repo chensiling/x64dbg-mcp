@@ -10,6 +10,11 @@ set(INTERMEDIATE_DIR "${CMAKE_BINARY_DIR}/intermediate")
 
 add_library(mcp_bridge SHARED
     bridge_plugin.cpp
+    util.cpp
+    commands.cpp
+    http_server.cpp
+    broker.cpp
+    instance_file.cpp
 )
 
 set_target_properties(mcp_bridge PROPERTIES
