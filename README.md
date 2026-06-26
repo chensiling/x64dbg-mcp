@@ -106,20 +106,28 @@ C:\path\to\x64dbg\release\x64\plugins\
 仓库中的源码来源：
 
 ```
-bridge-plugin\
-  bridge_plugin.cpp
+bridge-plugin\                     ← 编译为 build\mcp_bridge.dp64
+  bridge_plugin.h                 共享声明——extern全局变量、结构体、函数原型
+  bridge_plugin.cpp               插件生命周期 + 命令分发表 + process_request
+  util.cpp                        hex编解码、log、json辅助函数
+  commands.cpp                    全部40个命令处理器 + 断点条件辅助函数
+  http_server.cpp                 HTTP服务器——socket绑定、accept循环、请求路由
+  broker.cpp                      Broker管理——配置、进程启动、健康检查、watchdog
+  instance_file.cpp               临时目录实例文件读写
+  protocol.h                      命令名常量（与 tool_registry.py 保持一致）
+  build.bat                       VS编译脚本（入口）
+  CMakeLists.txt                  CMake编译配置
 
-mcp-server\
-  config.json
-  server.py
-  bridge_client.py
-  tool_registry.py
-  requirements.txt
-  web\
-    health.html
+mcp-server\                        ← 复制到 build\x64dbg-mcp\
+  config.json                     Broker/插件配置——broker地址、Python路径、watchdog
+  server.py                       MCP服务端——broker模式（HTTP）或stdio模式（MCP客户端）
+  bridge_client.py                HTTP客户端——连接broker或直连插件实例
+  tool_registry.py                MCP工具定义 + MCP名→桥接命令名映射
+  requirements.txt                唯一依赖：mcp>=1.0.0
+  web\health.html                 Broker健康状态可视化页面
 ```
 
-`build` 是完整部署产物目录，由 build.bat 或 CMake 从 `bridge-plugin` 和 `mcp-server` 生成。部署时应整体使用 `build\mcp_bridge.dp64` 和 `build\x64dbg-mcp`，不要只放一个 `server.py`。
+`build` 由 `build.bat` 或 CMake 从 `bridge-plugin`（编译为 `mcp_bridge.dp64`）和 `mcp-server`（复制到 `x64dbg-mcp\`）生成。部署时应整体使用这两个产物，不要只放一个 `server.py`。
 
 `config.json` 中的 `server_script` 默认是相对路径 `server.py`，C 插件会按 `x64dbg\plugins\x64dbg-mcp` 目录解析，不依赖仓库路径。`server.py --broker` 模式只启动 HTTP broker，不会加载 MCP stdio 依赖；作为 MCP 客户端入口运行时才会加载 `mcp` 包。
 
