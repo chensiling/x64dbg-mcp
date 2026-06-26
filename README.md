@@ -131,15 +131,19 @@ mcp-server\                        ← 复制到 build\x64dbg-mcp\
 
 `config.json` 中的 `server_script` 默认是相对路径 `server.py`，C 插件会按 `x64dbg\plugins\x64dbg-mcp` 目录解析，不依赖仓库路径。`server.py --broker` 模式只启动 HTTP broker，不会加载 MCP stdio 依赖；作为 MCP 客户端入口运行时才会加载 `mcp` 包。
 
-重启 x64dbg，插件自动加载后会检查并启动 broker，然后启动本实例 HTTP RPC 端口。
+重启 x64dbg，插件加载后会在 **Plugins 菜单** 中显示 `MCP Bridge Plugin`，其下有两个菜单项：
 
-### 4. 配置 MCP 客户端
+- **启动MCP服务器** — 启动 HTTP 监听，连接 broker，注册 session
+- **关闭MCP服务器** — 断开 session，停止 HTTP，清理资源
 
-启动顺序：
+插件加载后不会自动启动任何网络服务，所有日志输出到 x64dbg 的 Log 窗口（不再弹出 CMD 控制台窗口）。
 
-1. 先启动 x64dbg，插件会用相对路径启动 `x64dbg-mcp\server.py --broker`
-2. Broker 监听 `http://127.0.0.1:21463`
-3. 再启动 Agent 工具（如 Claude、Cursor、VS Code 等），通过 HTTP 连接 broker
+### 4. 启动与连接
+
+1. 启动 x64dbg，载入调试目标
+2. 在菜单栏点击 **Plugins → MCP Bridge Plugin → 启动MCP服务器**
+3. 插件自动启动 broker（`x64dbg-mcp\server.py --broker`），broker 监听 `http://127.0.0.1:21463`
+4. 配置 MCP 客户端连接 broker
 
 MCP 客户端配置使用 URL，不再让 Agent 工具启动 Python server：
 
@@ -159,8 +163,9 @@ MCP 客户端配置使用 URL，不再让 Agent 工具启动 Python server：
 ### 5. 使用
 
 1. 启动 x64dbg，载入调试目标
-2. 连接 MCP 客户端——桥接插件会自动弹控制台窗口，显示 HTTP 端口
-3. 通过 AI 控制调试器
+2. 点击 Plugins → MCP Bridge Plugin → 启动MCP服务器
+3. 连接 MCP 客户端，开始通过 AI 控制调试器
+4. 调试结束后点击 关闭MCP服务器 断开连接
 
 ## Broker 与实例发现
 
@@ -322,6 +327,7 @@ breakpoint_condition_clear addr="0x7FFC91037160"
 
 - **全链路十六进制字符串**——无 JSON 整数传递，任意 MCP 客户端（JavaScript / Python / C++）零精度丢失
 - **C 插件 + localhost HTTP**——支持多个 x64dbg 实例按端口区分，直接访问 x64dbg Bridge API
+- **菜单控制启停**——插件加载后不自动启动；通过 Plugins 菜单手动启动/关闭 MCP 服务，无 CMD 窗口
 - **Broker health 页面**——`/health` 返回可视化 HTML，`/api/health` 返回 watchdog 使用的 JSON
 - **插件 watchdog**——C 插件定期检查 broker，不可用时尝试重启，连续失败后弹窗提醒
 - **Python MCP stdio 服务端**——标准 MCP 协议，兼容所有 MCP 客户端

@@ -10,10 +10,10 @@ SOCKET g_listenSocket = INVALID_SOCKET;
 volatile LONG g_running = 0;
 int g_pluginHandle = 0;
 HMODULE g_hModule = NULL;
-bool g_consoleAllocated = false;
 unsigned short g_httpPort = 0;
 char g_instanceFile[MAX_PATH] = {0};
 volatile LONG g_sessionRegistered = 0;
+volatile LONG g_mcpRunning = 0;
 
 broker_config g_brokerConfig = {
     "http://127.0.0.1:21463",
@@ -146,21 +146,51 @@ void process_request(json_t* req, char* out_buf, size_t out_buf_size)
 }
 
 // ---------------------------------------------------------------------------
-// Plugin lifecycle (x64dbg entry points)
+// MCP server lifecycle
 // ---------------------------------------------------------------------------
 
-extern "C" __declspec(dllexport) bool pluginit(PLUG_INITSTRUCT* initStruct)
+void start_mcp_server()
 {
-    initStruct->sdkVersion = PLUG_SDKVERSION;
-    initStruct->pluginVersion = 1;
-    strncpy(initStruct->pluginName, "MCP Bridge Plugin", 256);
-    g_pluginHandle = initStruct->pluginHandle;
-    return true;
+    if(InterlockedCompareExchange(&g_mcpRunning, 0, 0))
+    {
+        log_msg("[MCP Bridge] MCP server is already running");
+        return;
+    }
+
+    InterlockedExchange(&g_mcpRunning, 1);
+    InterlockedExchange(&g_running, 1);
+    g_hHttpThread = CreateThread(NULL, 0, http_thread, NULL, 0, NULL);
+    g_hWatchdogThread = CreateThread(NULL, 0, watchdog_thread, NULL, 0, NULL);
+    log_msg("[MCP Bridge] MCP server started");
 }
 
-extern "C" __declspec(dllexport) bool plugstop()
+void stop_mcp_server()
 {
+    if(!InterlockedCompareExchange(&g_mcpRunning, 0, 0))
+    {
+        log_msg("[MCP Bridge] MCP server is not running");
+        return;
+    }
+
+    if(InterlockedCompareExchange(&g_sessionRegistered, 0, 0))
+    {
+        char pluginId[64] = {0};
+        snprintf(pluginId, sizeof(pluginId), "%lu:%u", GetCurrentProcessId(), (unsigned int)g_httpPort);
+        json_t* root = json_object();
+        json_object_set_new(root, "plugin_id", json_string(pluginId));
+        char* body = json_dumps(root, JSON_COMPACT);
+        json_decref(root);
+        if(body)
+        {
+            broker_request("POST", "/api/unregister_session", body, NULL, 0);
+            free(body);
+            InterlockedExchange(&g_sessionRegistered, 0);
+        }
+    }
+
+    InterlockedExchange(&g_mcpRunning, 0);
     InterlockedExchange(&g_running, 0);
+
     if(g_listenSocket != INVALID_SOCKET)
     {
         shutdown(g_listenSocket, SD_BOTH);
@@ -179,24 +209,54 @@ extern "C" __declspec(dllexport) bool plugstop()
         CloseHandle(g_hWatchdogThread);
         g_hWatchdogThread = NULL;
     }
+
+    delete_instance_file();
+    log_msg("[MCP Bridge] MCP server stopped");
+}
+
+static void mcp_menu_callback(CBTYPE cbType, void* callbackInfo)
+{
+    (void)cbType;
+    PLUG_CB_MENUENTRY* info = (PLUG_CB_MENUENTRY*)callbackInfo;
+    if(info->hEntry == MENU_ENTRY_START_MCP)
+        start_mcp_server();
+    else if(info->hEntry == MENU_ENTRY_STOP_MCP)
+        stop_mcp_server();
+}
+
+// ---------------------------------------------------------------------------
+// Plugin lifecycle (x64dbg entry points)
+// ---------------------------------------------------------------------------
+
+extern "C" __declspec(dllexport) bool pluginit(PLUG_INITSTRUCT* initStruct)
+{
+    initStruct->sdkVersion = PLUG_SDKVERSION;
+    initStruct->pluginVersion = 1;
+    strncpy(initStruct->pluginName, "MCP Bridge Plugin", 256);
+    g_pluginHandle = initStruct->pluginHandle;
+    return true;
+}
+
+extern "C" __declspec(dllexport) bool plugstop()
+{
+    stop_mcp_server();
     if(g_hBrokerProcess)
     {
         CloseHandle(g_hBrokerProcess);
         g_hBrokerProcess = NULL;
     }
-    delete_instance_file();
     return true;
 }
 
 extern "C" __declspec(dllexport) void plugsetup(PLUG_SETUPSTRUCT* setupStruct)
 {
-    (void)setupStruct;
-    init_console();
     load_broker_config();
-    InterlockedExchange(&g_running, 1);
-    g_hHttpThread = CreateThread(NULL, 0, http_thread, NULL, 0, NULL);
-    g_hWatchdogThread = CreateThread(NULL, 0, watchdog_thread, NULL, 0, NULL);
-    log_msg("[MCP Bridge] Plugin loaded successfully");
+
+    _plugin_menuaddentry(setupStruct->hMenu, MENU_ENTRY_START_MCP, "启动MCP服务器");
+    _plugin_menuaddentry(setupStruct->hMenu, MENU_ENTRY_STOP_MCP, "关闭MCP服务器");
+
+    _plugin_registercallback(g_pluginHandle, CB_MENUENTRY, mcp_menu_callback);
+    log_msg("[MCP Bridge] Plugin loaded successfully. Use Plugins menu to start/stop MCP server.");
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved)
@@ -206,6 +266,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
         g_hModule = hModule;
     if(ul_reason_for_call == DLL_PROCESS_DETACH)
     {
+        InterlockedExchange(&g_mcpRunning, 0);
         InterlockedExchange(&g_running, 0);
         delete_instance_file();
     }

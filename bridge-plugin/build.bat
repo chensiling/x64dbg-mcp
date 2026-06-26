@@ -20,7 +20,7 @@ echo Building x64 plugin...
 
 cl.exe /nologo /O2 /MD /LD /EHsc ^
     /I"%PLUGINSDK%" /I"%PLUGINSDK%\jansson" /I"%PLUGINSDK%\lz4" /I"%PLUGINSDK%\XEDParse" ^
-    /DBUILD_BRIDGE /D_CRT_SECURE_NO_WARNINGS /D_WIN64 ^
+    /utf-8 /DBUILD_BRIDGE /D_CRT_SECURE_NO_WARNINGS /D_WIN64 ^
     /Fe:"%OUT_DIR%\%PLUGIN_NAME%.dp64" ^
     "%SCRIPT_DIR%bridge_plugin.cpp" ^
     "%SCRIPT_DIR%util.cpp" ^

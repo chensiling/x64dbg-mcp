@@ -25,23 +25,6 @@ size_t hex_decode(const char* hex, unsigned char* out)
     return len;
 }
 
-void init_console()
-{
-    if(AllocConsole())
-    {
-        g_consoleAllocated = true;
-        FILE* dummy;
-        freopen_s(&dummy, "CONOUT$", "w", stdout);
-        freopen_s(&dummy, "CONOUT$", "w", stderr);
-        HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
-        SetConsoleTitleW(L"x64dbg MCP Bridge");
-        printf("========================================\n");
-        printf("  x64dbg MCP Bridge Plugin Console\n");
-        printf("  HTTP: pending\n");
-        printf("========================================\n\n");
-    }
-}
-
 void log_msg(const char* format, ...)
 {
     char buf[2048];
@@ -49,9 +32,6 @@ void log_msg(const char* format, ...)
     va_start(args, format);
     vsnprintf(buf, sizeof(buf), format, args);
     va_end(args);
-
-    if(g_consoleAllocated)
-        printf("%s\n", buf);
     _plugin_logputs(buf);
 }
 

@@ -30,7 +30,7 @@ extern SOCKET g_listenSocket;
 extern volatile LONG g_running;
 extern int g_pluginHandle;
 extern HMODULE g_hModule;
-extern bool g_consoleAllocated;
+extern volatile LONG g_mcpRunning;
 extern unsigned short g_httpPort;
 extern char g_instanceFile[MAX_PATH];
 extern volatile LONG g_sessionRegistered;
@@ -67,7 +67,6 @@ void process_request(json_t* req, char* out_buf, size_t out_buf_size);
 // ---------------------------------------------------------------------------
 void hex_encode(const unsigned char* data, size_t len, char* out);
 size_t hex_decode(const char* hex, unsigned char* out);
-void init_console();
 void log_msg(const char* format, ...);
 bool get_addr_param(json_t* params, const char* key, duint* out);
 bool get_int_param(json_t* params, const char* key, duint defaultVal, duint* out);
@@ -183,6 +182,14 @@ bool start_broker_process();
 void notify_broker_down_once();
 void register_or_unregister_session();
 DWORD WINAPI watchdog_thread(LPVOID param);
+
+// ---------------------------------------------------------------------------
+// MCP server lifecycle (bridge_plugin.cpp)
+// ---------------------------------------------------------------------------
+#define MENU_ENTRY_START_MCP 1
+#define MENU_ENTRY_STOP_MCP  2
+void start_mcp_server();
+void stop_mcp_server();
 
 // ---------------------------------------------------------------------------
 // Instance file management (instance_file.cpp)
